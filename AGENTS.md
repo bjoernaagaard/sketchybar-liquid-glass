@@ -33,7 +33,7 @@ For interface or motion changes, also read `~/.agents/skills/apple-design/SKILL.
 
 Never write unit tests, integration tests, or mocks. Write another kind of test only when the user explicitly asks, using real code and saving its output in the project. This overrides the skill's testing section. Do not create extra documentation unless requested.
 
-Run `plugins/popup.sh build` and the real affected command or popup. Open popups through actual bar clicks, not only from a terminal: process ancestry and calendar permission attribution differ. macOS `pgrep` needs `-a` to find SketchyBar when it is an ancestor. Check shell syntax with `/bin/bash -n` and the diff with `git diff --check`. Do not disable compiler safety settings to make a feature build.
+Run `plugins/popup.sh build` and the real affected command or popup. Popups must also be checked through actual bar clicks, not only from a terminal: process ancestry and calendar permission attribution differ. The user does those clicks. Never post synthetic mouse or keyboard events, move the cursor, or press keys on the user's machine. Instead, give the user a short numbered checklist of what to click and what to report back, then wait. macOS `pgrep` needs `-a` to find SketchyBar when it is an ancestor. Check shell syntax with `/bin/bash -n` and the diff with `git diff --check`. Do not disable compiler safety settings to make a feature build.
 
 Restart the existing service with:
 
@@ -41,4 +41,4 @@ Restart the existing service with:
 launchctl kickstart -k gui/$(id -u)/dev.mise.sketchybar
 ```
 
-Use `sketchybar --query <item>` for item bounds and the native window bounds for popups. Capture the right end at `-R2648,0,360,50`, extending the height when inspecting a popup. Verify opening, switching popups, outside click dismissal, Escape, and restart behavior. Do not change live network connections or calendar data just to demonstrate a code change. Delete screenshots and all scratch artifacts when finished. Leave one running bar and a clean, pushed working tree.
+Use `sketchybar --query <item>` for item bounds and the native window bounds for popups. Capture the right end at `-R2648,0,360,50`, extending the height when inspecting a popup. The checklist covers opening, switching popups, outside click dismissal, Escape, and behavior after a restart. Agents may restart the service and read window bounds themselves. Do not change live network connections or calendar data just to demonstrate a code change. Delete screenshots and all scratch artifacts when finished. Leave one running bar and a clean, pushed working tree.
