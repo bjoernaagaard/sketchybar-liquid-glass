@@ -34,12 +34,15 @@ case "$NAME" in
     $SB --set battery drawing=on icon="$icon" label="${pct}%"
     ;;
 
-  wifi)
-    dev=$(networksetup -listallhardwareports | awk '/Wi-Fi/{getline; print $2}')
-    if [ -n "$(ipconfig getifaddr "$dev" 2>/dev/null)" ]; then
-      $SB --set wifi icon=$'\xf4\x80\x99\x87' icon.color=$TEXT2
-    else
-      $SB --set wifi icon=$'\xf4\x80\x99\x88' icon.color=$TEXT3
-    fi
+  network)
+    kind=$("$CONFIG_DIR/plugins/.popup-helper" network-state | jq -r .kind)
+    [ -n "$kind" ] || exit 1
+    # SF Pro network: U+100906, verified in SF-Pro.ttf as glyph 14009.
+    case "$kind" in
+      wifi) icon=$'\xf4\x80\x99\x87'; color=$TEXT2 ;;
+      none) icon=$'\xf4\x80\xa4\x86'; color=$TEXT3 ;;
+      *)    icon=$'\xf4\x80\xa4\x86'; color=$TEXT2 ;;
+    esac
+    $SB "${COLOR_ANIM[@]}" --set network icon="$icon" icon.color=$color
     ;;
 esac

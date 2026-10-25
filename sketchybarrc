@@ -72,9 +72,10 @@ a+=(--add item clock right
                  script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh volume" update_freq=2
     --subscribe volume volume_change system_woke mouse.entered mouse.exited
 
-    --add item wifi right
-    --set wifi icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=30 script="$PLUGIN_DIR/status.sh"
-    --subscribe wifi wifi_change system_woke mouse.entered mouse.exited)
+    --add item network right
+    --set network icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=5 script="$PLUGIN_DIR/status.sh"
+                  click_script="$PLUGIN_DIR/popup.sh network"
+    --subscribe network wifi_change system_woke mouse.entered mouse.exited)
 
 $SB "${a[@]}"
 $SB --update

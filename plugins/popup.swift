@@ -1,6 +1,7 @@
 import AppKit
 import CoreAudio
 import EventKit
+import SystemConfiguration
 
 // System frameworks only. This process owns popups, never another bar.
 struct Audio {
@@ -110,6 +111,63 @@ struct Audio {
     }
 }
 
+struct NetworkConnection: Codable, Equatable {
+    let name: String
+    let interface: String
+    let kind: String
+    let addresses: [String]
+    let active: Bool
+    let primary: Bool
+}
+
+struct NetworkState: Codable, Equatable {
+    let connections: [NetworkConnection]
+    let kind: String
+
+    static func read() -> NetworkState? {
+        guard let preferences = SCPreferencesCreate(nil, "SketchyBar" as CFString, nil),
+              let currentSet = SCNetworkSetCopyCurrent(preferences),
+              let services = SCNetworkSetCopyServices(currentSet) as? [SCNetworkService],
+              let store = SCDynamicStoreCreate(nil, "SketchyBar" as CFString, nil, nil),
+              let state = SCDynamicStoreCopyMultiple(store, nil, [
+                "State:/Network/Global/IPv[46]",
+                "State:/Network/Service/.*/IPv[46]",
+                "State:/Network/Interface/.*/Link"
+              ] as CFArray) as? [String: [String: Any]] else { return nil }
+        let primary = state["State:/Network/Global/IPv4"]?["PrimaryService"] as? String
+            ?? state["State:/Network/Global/IPv6"]?["PrimaryService"] as? String
+        let configuration = SCPreferencesGetValue(preferences, "NetworkServices" as CFString) as? [String: [String: Any]] ?? [:]
+        let wiredTypes = [kSCNetworkInterfaceTypeEthernet, kSCNetworkInterfaceTypeBond, kSCNetworkInterfaceTypeVLAN] as [String]
+        let connections: [NetworkConnection] = services.compactMap { service in
+            guard let interface = SCNetworkServiceGetInterface(service),
+                  let type = SCNetworkInterfaceGetInterfaceType(interface) as String?,
+                  let device = SCNetworkInterfaceGetBSDName(interface) as String?,
+                  let id = SCNetworkServiceGetServiceID(service) as String? else { return nil }
+            // Match macOS settings: internal USB interfaces can have hidden services.
+            let metadata = configuration[id]?["Interface"] as? [String: Any]
+            guard metadata?["HiddenConfiguration"] as? Bool != true,
+                  wiredTypes.contains(type) || metadata?["Hardware"] as? String == "Ethernet"
+                    || type == kSCNetworkInterfaceTypeIEEE80211 as String else { return nil }
+            let addresses = ["IPv4", "IPv6"].flatMap { family in
+                state["State:/Network/Service/\(id)/\(family)"]?["Addresses"] as? [String] ?? []
+            }.filter { !$0.hasPrefix("169.254.") && !$0.lowercased().hasPrefix("fe80:") && $0 != "0.0.0.0" && $0 != "::" }
+            let link = state["State:/Network/Interface/\(device)/Link"]?["Active"] as? Bool ?? true
+            let active = SCNetworkServiceGetEnabled(service) && link && !addresses.isEmpty
+            return NetworkConnection(name: SCNetworkServiceGetName(service) as String? ?? device,
+                                     interface: device, kind: type == kSCNetworkInterfaceTypeIEEE80211 as String ? "wifi" : "ethernet",
+                                     addresses: active ? addresses : [], active: active, primary: active && id == primary)
+        }.sorted {
+            if $0.primary != $1.primary { return $0.primary }
+            if $0.active != $1.active { return $0.active }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+        // A route can belong to a VPN. Do not mislabel that route as Wi-Fi.
+        let kind = connections.first(where: { $0.primary })?.kind
+            ?? (connections.contains(where: { $0.active }) ? "network" : "none")
+        return NetworkState(connections: connections, kind: kind)
+    }
+}
+
 struct Theme {
     let environment = ProcessInfo.processInfo.environment
     func number(_ name: String) -> CGFloat { CGFloat(Double(environment[name]!)!) }
@@ -167,6 +225,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     var percentage: NSTextField?
     var mute: NSButton?
     var deviceSignature = ""
+    var networkState: NetworkState?
     var initialItem = "volume"
     var lock: Int32 = -1
     lazy var eventStore = EKEventStore()
@@ -204,7 +263,8 @@ final class Popups: NSObject, NSApplicationDelegate {
             if let pid = Int32(self.theme.environment["POPUP_BAR_PID"] ?? ""), kill(pid, 0) != 0 { NSApp.terminate(nil) }
             if self.panel.isVisible {
                 if self.item == "volume" { self.refreshVolume() }
-                else if self.calendarMinute != Int(Date().timeIntervalSince1970 / 60) || self.calendarDirty { self.loadCalendar() }
+                else if self.item == "network" { self.refreshNetwork() }
+                else if self.item == "clock" && (self.calendarMinute != Int(Date().timeIntervalSince1970 / 60) || self.calendarDirty) { self.loadCalendar() }
             }
         }
         RunLoop.main.add(timer!, forMode: .common)
@@ -238,7 +298,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     func toggle(_ next: String) {
-        guard next == "volume" || next == "clock" else { return }
+        guard next == "volume" || next == "clock" || next == "network" else { return }
         if item == next && panel.isVisible { close(); return }
         guard let rect = queryAnchor(next) else { close(); return }
         item = next
@@ -247,6 +307,10 @@ final class Popups: NSObject, NSApplicationDelegate {
             buildVolume()
             panel.makeKeyAndOrderFront(nil)
             panel.makeFirstResponder(slider)
+        } else if next == "network" {
+            networkState = NetworkState.read()
+            buildNetwork()
+            panel.makeKeyAndOrderFront(nil)
         } else {
             events = []
             calendarError = nil
@@ -356,6 +420,57 @@ final class Popups: NSObject, NSApplicationDelegate {
         do { try action() }
         catch { NSAlert(error: error).beginSheetModal(for: panel) }
         refreshVolume()
+    }
+
+    func refreshNetwork() {
+        let state = NetworkState.read()
+        if state != networkState {
+            networkState = state
+            buildNetwork()
+        }
+    }
+
+    func buildNetwork() {
+        let connections = networkState?.connections ?? []
+        let pad = theme.number("POPUP_PADDING")
+        let width = theme.number("POPUP_WIDTH")
+        let row = theme.number("POPUP_ROW")
+        let view = surface(height: pad * 2 + row * CGFloat(3 + connections.count * 2))
+        label("Network", x: pad, y: pad, width: width - pad * 2, in: view)
+        for (index, connection) in connections.enumerated() {
+            let y = pad + row * CGFloat(1 + index * 2)
+            label(connection.primary ? "✓" : "", x: pad, y: y, width: 18, in: view)
+            label(connection.name, x: pad + 22, y: y, width: width - pad * 2 - 22,
+                  color: connection.active ? "TEXT" : "TEXT3", in: view)
+            let device = label(connection.interface, x: 0, y: y + 24, width: width, color: "TEXT3", in: view)
+            device.sizeToFit()
+            device.setFrameOrigin(NSPoint(x: width - pad - device.frame.width, y: y + 24))
+            let details = connection.addresses.first ?? "Not connected"
+            let addressWidth = device.frame.minX - pad - 22 - theme.number("POPUP_GAP")
+            let address = label(details, x: pad + 22, y: y + 24, width: addressWidth, color: "TEXT2", in: view)
+            address.toolTip = connection.addresses.isEmpty ? details : connection.addresses.joined(separator: "\n")
+            address.setAccessibilityValue(address.toolTip)
+        }
+        let wifi = NSButton(title: "Wi-Fi Settings…", target: self, action: #selector(openWiFiSettings))
+        wifi.frame = NSRect(x: pad, y: pad + row * CGFloat(1 + connections.count * 2), width: width - pad * 2, height: row)
+        wifi.bezelStyle = .inline
+        wifi.font = theme.font
+        view.addSubview(wifi)
+        let network = NSButton(title: "Network Settings…", target: self, action: #selector(openNetworkSettings))
+        network.frame = NSRect(x: pad, y: pad + row * CGFloat(2 + connections.count * 2), width: width - pad * 2, height: row)
+        network.bezelStyle = .inline
+        network.font = theme.font
+        view.addSubview(network)
+    }
+
+    @objc func openWiFiSettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.wifi-settings-extension")!)
+        close()
+    }
+
+    @objc func openNetworkSettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Network-Settings.extension")!)
+        close()
     }
 
     @objc func calendarChanged() {
@@ -516,6 +631,10 @@ final class Popups: NSObject, NSApplicationDelegate {
 let arguments = CommandLine.arguments
 if arguments.count > 1 && arguments[1] == "audio" {
     let data = try JSONSerialization.data(withJSONObject: Audio.snapshot(), options: [.sortedKeys])
+    print(String(decoding: data, as: UTF8.self))
+} else if arguments.count > 1 && arguments[1] == "network-state" {
+    guard let state = NetworkState.read() else { exit(1) }
+    let data = try JSONEncoder().encode(state)
     print(String(decoding: data, as: UTF8.self))
 } else if arguments.count > 1 && arguments[1] == "stop" {
     DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": "stop"], deliverImmediately: true)
