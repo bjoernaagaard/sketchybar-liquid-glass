@@ -1,4 +1,10 @@
 #!/bin/bash
+if [ "$NAME" = media ]; then
+  case "$SENDER" in
+    mouse.entered) "$CONFIG_DIR/plugins/popup.sh" media-hover ;;
+    mouse.exited)  "$CONFIG_DIR/plugins/popup.sh" media-hover-end ;;
+  esac
+fi
 "$CONFIG_DIR/plugins/hover.sh" && exit 0
 source "$CONFIG_DIR/theme.sh"
 
@@ -32,6 +38,20 @@ case "$NAME" in
     elif [ "$pct" -ge 13 ]; then icon=$'\xf4\x80\x9b\xa9'
     else icon=$'\xf4\x80\x9b\xaa'; fi
     $SB --set battery drawing=on icon="$icon" label="${pct}%"
+    ;;
+
+  media)
+    state=$("$CONFIG_DIR/plugins/.popup-helper" media-state)
+    if [ -z "$state" ]; then
+      # SF Pro music.note U+10046A, verified in SF-Pro.ttf as glyph 15101.
+      $SB --set media icon=$'\xf4\x80\x91\xaa' icon.color=$TEXT3 label="Media unavailable"
+      exit 0
+    fi
+    IFS=$'\t' read -r playing label < <(printf '%s' "$state" | jq -r '[(.playing // false), (if .title == null or .title == "" then "Not playing" elif .artist == null or .artist == "" then .title else .title + " · " + .artist end)] | @tsv')
+    # SF Pro pause.fill U+100286 and play.fill U+100284, verified in SF-Pro.ttf.
+    if [ "$playing" = true ]; then icon=$'\xf4\x80\x8a\x86'; color=$TEXT
+    else icon=$'\xf4\x80\x8a\x84'; color=$TEXT2; fi
+    $SB "${COLOR_ANIM[@]}" --set media icon="$icon" icon.color=$color label="$label"
     ;;
 
   network)

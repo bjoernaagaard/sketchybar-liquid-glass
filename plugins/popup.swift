@@ -8,7 +8,7 @@ import os
 private let logger = Logger(subsystem: "com.bjoernaagaard.sketchybar", category: "popup")
 
 enum PopupKind: String {
-    case volume, clock, network, tailscale
+    case volume, clock, network, tailscale, media
 }
 
 enum NetworkKind: String, Codable {
@@ -120,6 +120,117 @@ struct Audio {
         let id = current
         return ["current": id, "volume": volume(id).map { Int(($0 * 100).rounded()) } as Any? ?? NSNull(),
                 "muted": muted(id), "devices": devices().map { ["id": $0.id, "name": $0.name] as [String: Any] }]
+    }
+}
+
+enum MediaError: LocalizedError {
+    case missingCLI
+    case commandFailed(String)
+    case invalidOutput
+
+    var errorDescription: String? {
+        switch self {
+        case .missingCLI: "The media-control command was not found on PATH."
+        case .commandFailed(let message): message
+        case .invalidOutput: "media-control returned information this helper cannot read."
+        }
+    }
+}
+
+enum MediaAction: String {
+    case playPause = "play-pause", next, previous
+
+    var argument: String {
+        switch self {
+        case .playPause: "toggle-play-pause"
+        case .next: "next-track"
+        case .previous: "previous-track"
+        }
+    }
+}
+
+struct MediaSnapshot: Codable, Equatable {
+    let title: String
+    let artist: String
+    let bundleIdentifier: String
+    let processIdentifier: Int32?
+    let playing: Bool
+    let artworkData: Data?
+
+    enum CodingKeys: String, CodingKey {
+        case title, artist, bundleIdentifier, processIdentifier, playing, artworkData
+    }
+
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        title = try values.decodeIfPresent(String.self, forKey: .title) ?? ""
+        artist = try values.decodeIfPresent(String.self, forKey: .artist) ?? ""
+        bundleIdentifier = try values.decodeIfPresent(String.self, forKey: .bundleIdentifier) ?? ""
+        processIdentifier = try values.decodeIfPresent(Int32.self, forKey: .processIdentifier)
+        playing = try values.decodeIfPresent(Bool.self, forKey: .playing) ?? false
+        artworkData = try values.decodeIfPresent(Data.self, forKey: .artworkData)
+    }
+
+    var applicationName: String {
+        if let processIdentifier, let name = NSRunningApplication(processIdentifier: processIdentifier)?.localizedName {
+            return name
+        }
+        return bundleIdentifier
+    }
+
+    var contentSignature: [String] {
+        [title, artist, bundleIdentifier, playing ? "playing" : "paused"]
+    }
+}
+
+struct Media {
+    static func executable() throws(MediaError) -> URL {
+        let paths = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
+        guard let path = paths.map({ "\($0)/media-control" }).first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw .missingCLI
+        }
+        return URL(fileURLWithPath: path)
+    }
+
+    static func read(artwork: Bool = false) throws(MediaError) -> MediaSnapshot? {
+        let process = Process()
+        let output = Pipe()
+        let errors = Pipe()
+        do { process.executableURL = try executable() }
+        catch { throw error }
+        process.arguments = ["get"] + (artwork ? [] : ["--no-artwork"])
+        process.standardOutput = output
+        process.standardError = errors
+        do { try process.run() }
+        catch { throw .commandFailed(error.localizedDescription) }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let failure = errors.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let message = String(decoding: failure, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw .commandFailed(message.isEmpty ? "media-control get failed." : message)
+        }
+        guard !data.isEmpty else { return nil }
+        do { return try JSONDecoder().decode(MediaSnapshot?.self, from: data) }
+        catch { throw .invalidOutput }
+    }
+
+    static func perform(_ action: MediaAction) throws(MediaError) {
+        let process = Process()
+        let errors = Pipe()
+        do { process.executableURL = try executable() }
+        catch { throw error }
+        process.arguments = [action.argument]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errors
+        do { try process.run() }
+        catch { throw .commandFailed(error.localizedDescription) }
+        let failure = errors.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let message = String(decoding: failure, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw .commandFailed(message.isEmpty ? "media-control \(action.argument) failed." : message)
+        }
     }
 }
 
@@ -463,7 +574,11 @@ final class Popups: NSObject, NSApplicationDelegate {
     var mute: NSButton?
     var deviceSignature = ""
     var networkState: NetworkState?
+    var media: MediaSnapshot?
+    var mediaError: MediaError?
     var initialItem = PopupKind.volume
+    var initialCommand = PopupKind.volume.rawValue
+    var hoverCanClose = false
     var lock: Int32 = -1
     lazy var eventStore = EKEventStore()
     var calendarAccessTask: Task<Void, Never>?
@@ -515,6 +630,10 @@ final class Popups: NSObject, NSApplicationDelegate {
                 case .volume: self.refreshVolume()
                 case .network: self.refreshNetwork()
                 case .tailscale: if Date().timeIntervalSince(self.tailscaleRead) >= 2 { self.refreshTailscale() }
+                case .media:
+                    self.refreshMedia()
+                    let pointer = NSEvent.mouseLocation
+                    if self.hoverCanClose && !self.anchor.contains(pointer) && !self.panel.frame.contains(pointer) { self.close() }
                 case .clock:
                     if self.calendarMinute != Int(Date().timeIntervalSince1970 / 60) || self.calendarDirty { self.loadCalendar() }
                 case nil: break
@@ -523,7 +642,8 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
-        toggle(initialItem)
+        if initialCommand == "media-hover" { show(initialItem) }
+        else { toggle(initialItem) }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -542,6 +662,8 @@ final class Popups: NSObject, NSApplicationDelegate {
     @objc func receive(_ notification: Notification) {
         guard let item = notification.userInfo?["item"] as? String else { return }
         if item == "stop" { NSApp.terminate(nil) }
+        else if item == "media-hover" { show(.media) }
+        else if item == "media-hover-end" { if self.item == .media { hoverCanClose = true } }
         else if let popup = PopupKind(rawValue: item) { toggle(popup) }
     }
 
@@ -565,7 +687,14 @@ final class Popups: NSObject, NSApplicationDelegate {
         return NSRect(x: origin[0], y: screen.frame.maxY - origin[1] - size[1], width: size[0], height: size[1])
     }
 
+    func show(_ next: PopupKind) {
+        hoverCanClose = false
+        if item == next && panel.isVisible { return }
+        toggle(next)
+    }
+
     func toggle(_ next: PopupKind) {
+        hoverCanClose = false
         if item == next && panel.isVisible { close(); return }
         guard let rect = queryAnchor(next) else { close(); return }
         item = next
@@ -583,6 +712,10 @@ final class Popups: NSObject, NSApplicationDelegate {
             readTailscale()
             buildTailscale()
             panel.makeKeyAndOrderFront(nil)
+        case .media:
+            readMedia()
+            buildMedia()
+            panel.makeKeyAndOrderFront(nil)
         case .clock:
             events = []
             calendarError = nil
@@ -592,7 +725,10 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc func close() { panel.orderOut(nil) }
+    @objc func close() {
+        hoverCanClose = false
+        panel.orderOut(nil)
+    }
 
     func surface(height: CGFloat) -> Surface {
         let width = theme.number("POPUP_WIDTH")
@@ -692,6 +828,101 @@ final class Popups: NSObject, NSApplicationDelegate {
         do { try action() }
         catch { NSAlert(error: error).beginSheetModal(for: panel) }
         refreshVolume()
+    }
+
+    func readMedia() {
+        do {
+            media = try Media.read(artwork: true)
+            mediaError = nil
+        } catch {
+            media = nil
+            mediaError = error
+        }
+    }
+
+    func refreshMedia() {
+        guard item == .media else { return }
+        let previous = media?.contentSignature
+        let previousError = mediaError?.localizedDescription
+        readMedia()
+        if previous != media?.contentSignature || previousError != mediaError?.localizedDescription {
+            buildMedia()
+        }
+    }
+
+    func buildMedia() {
+        let pad = theme.number("POPUP_PADDING")
+        let width = theme.number("POPUP_WIDTH")
+        let row = theme.number("POPUP_ROW")
+        let artworkSize: CGFloat = 48
+        let contentY = pad + row
+        let view = surface(height: pad * 2 + row * 2 + artworkSize + 16)
+        label("Now Playing", x: pad, y: pad, width: width - pad * 2 - 100, in: view)
+        let application = label(media?.applicationName ?? "", x: width - pad - 100, y: pad, width: 100, color: "TEXT3", in: view)
+        application.alignment = .right
+
+        let artwork = NSImageView(frame: NSRect(x: pad, y: contentY, width: artworkSize, height: artworkSize))
+        artwork.wantsLayer = true
+        artwork.layer?.cornerRadius = 6
+        artwork.layer?.masksToBounds = true
+        artwork.imageScaling = .scaleProportionallyUpOrDown
+        if let data = media?.artworkData, let image = NSImage(data: data) {
+            artwork.image = image
+        } else {
+            artwork.image = NSImage(systemSymbolName: "music.note", accessibilityDescription: "No artwork")
+            artwork.contentTintColor = theme.color("TEXT2")
+        }
+        artwork.setAccessibilityLabel("Album artwork")
+        view.addSubview(artwork)
+
+        let textX = pad + artworkSize + 12
+        let textWidth = width - textX - pad
+        let title = media?.title.isEmpty == false ? media?.title ?? "" : "Not playing"
+        let detail = mediaError?.localizedDescription ?? (media?.artist.isEmpty == false ? media?.artist ?? "" : "No active media")
+        label(title, x: textX, y: contentY + 2, width: textWidth, in: view)
+        label(detail, x: textX, y: contentY + 26, width: textWidth, color: "TEXT2", in: view)
+
+        let controlsY = contentY + artworkSize + 12
+        let buttonWidth: CGFloat = 64
+        let spacing: CGFloat = 8
+        let controlsWidth = buttonWidth * 3 + spacing * 2
+        let startX = (width - controlsWidth) / 2
+        func control(_ symbol: String, _ help: String, x: CGFloat, action: Selector) {
+            let button = NSButton(frame: NSRect(x: x, y: controlsY, width: buttonWidth, height: row))
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: help)
+            button.imagePosition = .imageOnly
+            button.bezelStyle = .inline
+            button.contentTintColor = theme.color("TEXT")
+            button.isEnabled = media != nil
+            button.toolTip = help
+            button.setAccessibilityLabel(help)
+            button.target = self
+            button.action = action
+            view.addSubview(button)
+        }
+        control("backward.fill", "Previous", x: startX, action: #selector(previousMedia))
+        control(media?.playing == true ? "pause.fill" : "play.fill", media?.playing == true ? "Pause" : "Play or pause",
+                x: startX + buttonWidth + spacing, action: #selector(playPauseMedia))
+        control("forward.fill", "Next", x: startX + (buttonWidth + spacing) * 2, action: #selector(nextMedia))
+    }
+
+    func performMedia(_ action: MediaAction) {
+        do {
+            try Media.perform(action)
+            trigger("media_change")
+            readMedia()
+            buildMedia()
+        } catch {
+            NSAlert(error: error).beginSheetModal(for: panel)
+        }
+    }
+
+    func trigger(_ event: String) {
+        let bar = Process()
+        bar.executableURL = URL(fileURLWithPath: theme.sketchybarPath)
+        bar.arguments = ["--trigger", event]
+        try? bar.run()
+        bar.waitUntilExit()
     }
 
     func refreshNetwork() {
@@ -940,11 +1171,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     func finishTailscale(_ process: Process, status: Int32, errors: Data) {
         guard tailscaleCommand === process else { return }
         tailscaleCommand = nil
-        let bar = Process()
-        bar.executableURL = URL(fileURLWithPath: theme.sketchybarPath)
-        bar.arguments = ["--trigger", "tailscale_change"]
-        try? bar.run()
-        bar.waitUntilExit()
+        trigger("tailscale_change")
         guard item == .tailscale && panel.isVisible else { return }
         if status != 0 && status != SIGTERM {
             tailscaleLogin = false
@@ -1138,6 +1365,9 @@ final class Popups: NSObject, NSApplicationDelegate {
     @objc func changeVolume(_ sender: NSSlider) { perform { try Audio.setVolume(Float(sender.doubleValue / 100)) } }
     @objc func changeMute(_ sender: NSButton) { perform { try Audio.setMuted(sender.state == .on) } }
     @objc func changeDevice(_ sender: OutputButton) { perform { try Audio.select(sender.device) } }
+    @objc func previousMedia() { performMedia(.previous) }
+    @objc func playPauseMedia() { performMedia(.playPause) }
+    @objc func nextMedia() { performMedia(.next) }
 }
 
 // NSApplication.delegate is weak. This lazy process-lifetime owner keeps the UI
@@ -1161,6 +1391,18 @@ if arguments.count > 1 && arguments[1] == "audio" {
     guard let state = NetworkState.read() else { exit(1) }
     let data = try JSONEncoder().encode(state)
     print(String(decoding: data, as: UTF8.self))
+} else if arguments.count > 1 && arguments[1] == "media-hover-end" {
+    DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": "media-hover-end"], deliverImmediately: true)
+} else if arguments.count > 1 && arguments[1] == "media-state" {
+    let snapshot = try Media.read()
+    let data = try JSONEncoder().encode(snapshot)
+    print(String(decoding: data, as: UTF8.self))
+} else if arguments.count > 2 && arguments[1] == "media" {
+    guard let action = MediaAction(rawValue: arguments[2]) else {
+        logger.error("Unknown media command: \(arguments[2])")
+        exit(EXIT_FAILURE)
+    }
+    try Media.perform(action)
 } else if arguments.count > 1 && arguments[1] == "tailscale-state" {
     let data = try JSONEncoder().encode(["kind": Tailscale.kind()])
     print(String(decoding: data, as: UTF8.self))
@@ -1168,7 +1410,8 @@ if arguments.count > 1 && arguments[1] == "audio" {
     DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": "stop"], deliverImmediately: true)
 } else {
     let command = arguments.count > 1 ? arguments[1] : PopupKind.volume.rawValue
-    guard let popup = PopupKind(rawValue: command) else {
+    let popup = command == "media-hover" ? PopupKind.media : PopupKind(rawValue: command)
+    guard let popup else {
         logger.error("Unknown popup command: \(command)")
         exit(EXIT_FAILURE)
     }
@@ -1176,12 +1419,13 @@ if arguments.count > 1 && arguments[1] == "audio" {
     app.setActivationPolicy(.accessory)
     let delegate = PopupRuntime.delegate
     delegate.initialItem = popup
+    delegate.initialCommand = command
     DistributedNotificationCenter.default().addObserver(delegate, selector: #selector(Popups.receive(_:)), name: Popups.notification, object: nil)
     // Lock the existing source inode, not a scratch file. The kernel releases it on exit.
     delegate.lock = open(delegate.theme.configDirectory + "/plugins/popup.swift", O_RDONLY)
     guard delegate.lock >= 0 else { exit(1) }
     if flock(delegate.lock, LOCK_EX | LOCK_NB) != 0 {
-        DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": delegate.initialItem.rawValue], deliverImmediately: true)
+        DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": delegate.initialCommand], deliverImmediately: true)
         exit(0)
     }
     app.delegate = delegate

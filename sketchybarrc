@@ -18,7 +18,8 @@ a+=(--default updates=when_shown
 
 a+=(--add event aerospace_workspace_change
     --add event aerospace_focus_change
-    --add event tailscale_change)
+    --add event tailscale_change
+    --add event media_change)
 
 gap() { a+=(--add item "$1" left --set "$1" width=$2); }
 
@@ -73,6 +74,11 @@ a+=(--add item clock right
     --set volume icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
                  script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh volume" update_freq=2
     --subscribe volume volume_change system_woke mouse.entered mouse.exited
+
+    --add item media center
+    --set media icon.padding_left=8 icon.padding_right=6 label.padding_right=8 label.max_chars=40
+                 update_freq=2 script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh media"
+    --subscribe media media_change system_woke mouse.entered mouse.exited
 
     --add item network right
     --set network icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=5 script="$PLUGIN_DIR/status.sh"
