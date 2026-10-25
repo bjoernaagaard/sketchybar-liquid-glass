@@ -17,7 +17,8 @@ a+=(--default updates=when_shown
     background.height=22 background.corner_radius=8 background.color=$CLEAR)
 
 a+=(--add event aerospace_workspace_change
-    --add event aerospace_focus_change)
+    --add event aerospace_focus_change
+    --add event tailscale_change)
 
 gap() { a+=(--add item "$1" left --set "$1" width=$2); }
 
@@ -76,7 +77,12 @@ a+=(--add item clock right
     --add item network right
     --set network icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=5 script="$PLUGIN_DIR/status.sh"
                   click_script="$PLUGIN_DIR/popup.sh network"
-    --subscribe network wifi_change system_woke mouse.entered mouse.exited)
+    --subscribe network wifi_change system_woke mouse.entered mouse.exited
+
+    --add item tailscale right
+    --set tailscale icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=5 script="$PLUGIN_DIR/status.sh"
+                    click_script="$PLUGIN_DIR/popup.sh tailscale"
+    --subscribe tailscale tailscale_change wifi_change system_woke mouse.entered mouse.exited)
 
 $SB "${a[@]}"
 $SB --update

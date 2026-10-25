@@ -45,4 +45,18 @@ case "$NAME" in
     esac
     $SB "${COLOR_ANIM[@]}" --set network icon="$icon" icon.color=$color
     ;;
+
+  tailscale)
+    kind=$("$CONFIG_DIR/plugins/.popup-helper" tailscale-state | jq -r .kind)
+    [ -n "$kind" ] || exit 1
+    # SF Pro circle.grid.3x3.fill U+1001F9 and circle.grid.3x3 U+1001F8, both in SF-Pro.ttf.
+    case "$kind" in
+      exit-node)   icon=$'\xf4\x80\x87\xb9'; color=$TEXT ;;
+      running)     icon=$'\xf4\x80\x87\xb9'; color=$TEXT2 ;;
+      stopped)     icon=$'\xf4\x80\x87\xb9'; color=$TEXT3 ;;
+      login)       icon=$'\xf4\x80\x87\xb8'; color=$TEXT2 ;;
+      *)           icon=$'\xf4\x80\x87\xb8'; color=$TEXT3 ;;
+    esac
+    $SB "${COLOR_ANIM[@]}" --set tailscale icon="$icon" icon.color=$color
+    ;;
 esac
