@@ -24,5 +24,6 @@ fi
 export CONFIG_DIR TEXT TEXT2 TEXT3 BAR_COLOR BAR_EDGE
 export POPUP_RADIUS POPUP_WIDTH POPUP_GAP POPUP_PADDING POPUP_ROW CALENDAR_TODAY_SIZE
 export SB="$(command -v "$SB")"
-export POPUP_BAR_PID="$(pgrep -x sketchybar)"
+# macOS pgrep excludes ancestors by default. A bar click runs under SketchyBar.
+export POPUP_BAR_PID="$(/usr/bin/pgrep -a -x -u "$UID" sketchybar)"
 "$HELPER" "${1:-$NAME}" </dev/null >/dev/null 2>&1 &

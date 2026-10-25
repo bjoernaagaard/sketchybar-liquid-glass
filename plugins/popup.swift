@@ -1,7 +1,19 @@
+// Before feature work, read ../AGENTS.md and ~/.agents/skills/write-swift/SKILL.md.
 import AppKit
 import CoreAudio
 import EventKit
 import SystemConfiguration
+import os
+
+private let logger = Logger(subsystem: "com.bjoernaagaard.sketchybar", category: "popup")
+
+enum PopupKind: String {
+    case volume, clock, network
+}
+
+enum NetworkKind: String, Codable {
+    case ethernet, wifi, network, none
+}
 
 // System frameworks only. This process owns popups, never another bar.
 struct Audio {
@@ -13,7 +25,7 @@ struct Audio {
         AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
     }
 
-    static func scalar<T>(_ id: AudioObjectID, _ address: AudioObjectPropertyAddress, _ initial: T) -> T? {
+    static func scalar<T: BitwiseCopyable>(_ id: AudioObjectID, _ address: AudioObjectPropertyAddress, _ initial: T) -> T? {
         var address = address
         var value = initial
         var size = UInt32(MemoryLayout<T>.size)
@@ -23,7 +35,7 @@ struct Audio {
         return status == noErr ? value : nil
     }
 
-    static func set<T>(_ id: AudioObjectID, _ address: AudioObjectPropertyAddress, _ value: T) throws {
+    static func set<T: BitwiseCopyable>(_ id: AudioObjectID, _ address: AudioObjectPropertyAddress, _ value: T) throws {
         var address = address
         var value = value
         let status = withUnsafePointer(to: &value) {
@@ -114,7 +126,7 @@ struct Audio {
 struct NetworkConnection: Codable, Equatable {
     let name: String
     let interface: String
-    let kind: String
+    let kind: NetworkKind
     let addresses: [String]
     let active: Bool
     let primary: Bool
@@ -122,7 +134,7 @@ struct NetworkConnection: Codable, Equatable {
 
 struct NetworkState: Codable, Equatable {
     let connections: [NetworkConnection]
-    let kind: String
+    let kind: NetworkKind
 
     static func read() -> NetworkState? {
         guard let preferences = SCPreferencesCreate(nil, "SketchyBar" as CFString, nil),
@@ -154,7 +166,7 @@ struct NetworkState: Codable, Equatable {
             let link = state["State:/Network/Interface/\(device)/Link"]?["Active"] as? Bool ?? true
             let active = SCNetworkServiceGetEnabled(service) && link && !addresses.isEmpty
             return NetworkConnection(name: SCNetworkServiceGetName(service) as String? ?? device,
-                                     interface: device, kind: type == kSCNetworkInterfaceTypeIEEE80211 as String ? "wifi" : "ethernet",
+                                     interface: device, kind: type == kSCNetworkInterfaceTypeIEEE80211 as String ? .wifi : .ethernet,
                                      addresses: active ? addresses : [], active: active, primary: active && id == primary)
         }.sorted {
             if $0.primary != $1.primary { return $0.primary }
@@ -163,21 +175,68 @@ struct NetworkState: Codable, Equatable {
         }
         // A route can belong to a VPN. Do not mislabel that route as Wi-Fi.
         let kind = connections.first(where: { $0.primary })?.kind
-            ?? (connections.contains(where: { $0.active }) ? "network" : "none")
+            ?? (connections.contains(where: { $0.active }) ? NetworkKind.network : .none)
         return NetworkState(connections: connections, kind: kind)
     }
 }
 
-struct Theme {
-    let environment = ProcessInfo.processInfo.environment
-    func number(_ name: String) -> CGFloat { CGFloat(Double(environment[name]!)!) }
-    func color(_ name: String) -> NSColor {
-        let value = UInt32(environment[name]!.replacingOccurrences(of: "0x", with: ""), radix: 16)!
-        return NSColor(srgbRed: CGFloat((value >> 16) & 255) / 255,
-                       green: CGFloat((value >> 8) & 255) / 255,
-                       blue: CGFloat(value & 255) / 255,
-                       alpha: CGFloat(value >> 24) / 255)
+enum ConfigurationError: LocalizedError {
+    case missingValue(String)
+    case invalidValue(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingValue(let name): "Missing popup environment value: \(name). Launch through plugins/popup.sh."
+        case .invalidValue(let name): "Invalid popup environment value: \(name). Check theme.sh and plugins/popup.sh."
+        }
     }
+}
+
+struct Theme {
+    let configDirectory: String
+    let sketchybarPath: String
+    let barPID: Int32
+    private let numbers: [String: CGFloat]
+    private let colors: [String: NSColor]
+
+    init() throws(ConfigurationError) {
+        let environment = ProcessInfo.processInfo.environment
+        func required(_ name: String) throws(ConfigurationError) -> String {
+            guard let value = environment[name], !value.isEmpty else { throw ConfigurationError.missingValue(name) }
+            return value
+        }
+        configDirectory = try required("CONFIG_DIR")
+        sketchybarPath = try required("SB")
+        guard let pid = Int32(try required("POPUP_BAR_PID")), pid > 0 else { throw ConfigurationError.invalidValue("POPUP_BAR_PID") }
+        barPID = pid
+        var numbers: [String: CGFloat] = [:]
+        for name in ["POPUP_RADIUS", "POPUP_WIDTH", "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE"] {
+            guard let value = Double(try required(name)), value.isFinite, value >= 0 else { throw ConfigurationError.invalidValue(name) }
+            numbers[name] = CGFloat(value)
+        }
+        self.numbers = numbers
+        var colors: [String: NSColor] = [:]
+        for name in ["TEXT", "TEXT2", "TEXT3", "BAR_COLOR", "BAR_EDGE"] {
+            let raw = try required(name)
+            guard raw.hasPrefix("0x"), let value = UInt32(raw.dropFirst(2), radix: 16) else { throw ConfigurationError.invalidValue(name) }
+            colors[name] = NSColor(srgbRed: CGFloat((value >> 16) & 255) / 255,
+                                  green: CGFloat((value >> 8) & 255) / 255,
+                                  blue: CGFloat(value & 255) / 255,
+                                  alpha: CGFloat(value >> 24) / 255)
+        }
+        self.colors = colors
+    }
+
+    func number(_ name: String) -> CGFloat {
+        guard let value = numbers[name] else { preconditionFailure("Unknown layout key: \(name)") }
+        return value
+    }
+
+    func color(_ name: String) -> NSColor {
+        guard let value = colors[name] else { preconditionFailure("Unknown color key: \(name)") }
+        return value
+    }
+
     var font: NSFont { NSFont(name: "SF Pro Semibold", size: 13) ?? .systemFont(ofSize: 13, weight: .semibold) }
 }
 
@@ -190,7 +249,7 @@ final class PopupPanel: NSPanel {
 final class Surface: NSView {
     let theme: Theme
     init(frame: NSRect, theme: Theme) { self.theme = theme; super.init(frame: frame) }
-    required init?(coder: NSCoder) { fatalError() }
+    required init?(coder: NSCoder) { fatalError("Surface is constructed in code, not decoded from an archive.") }
     override var isFlipped: Bool { true }
     override func draw(_ dirtyRect: NSRect) {
         guard enclosingScrollView == nil else { return }
@@ -215,9 +274,9 @@ struct CalendarEvent {
 
 final class Popups: NSObject, NSApplicationDelegate {
     static let notification = Notification.Name("com.bjoernaagaard.sketchybar.popup")
-    let theme = Theme()
+    let theme: Theme
     let panel = PopupPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-    var item = ""
+    var item: PopupKind?
     var anchor = NSRect.zero
     var monitors: [Any] = []
     var timer: Timer?
@@ -226,7 +285,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     var mute: NSButton?
     var deviceSignature = ""
     var networkState: NetworkState?
-    var initialItem = "volume"
+    var initialItem = PopupKind.volume
     var lock: Int32 = -1
     lazy var eventStore = EKEventStore()
     var calendarAccessTask: Task<Void, Never>?
@@ -234,7 +293,12 @@ final class Popups: NSObject, NSApplicationDelegate {
     var calendarBusy = false
     var calendarDirty = true
     var calendarMinute = -1
-    var calendarError: Error?
+    var calendarError: (any Error)?
+
+    init(theme: Theme) {
+        self.theme = theme
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         panel.isOpaque = false
@@ -262,11 +326,14 @@ final class Popups: NSObject, NSApplicationDelegate {
             // This timer is installed only on RunLoop.main. Assert that SDK boundary.
             MainActor.assumeIsolated {
                 guard let self else { return }
-                if let pid = Int32(self.theme.environment["POPUP_BAR_PID"] ?? ""), kill(pid, 0) != 0 { NSApp.terminate(nil) }
-                if self.panel.isVisible {
-                    if self.item == "volume" { self.refreshVolume() }
-                    else if self.item == "network" { self.refreshNetwork() }
-                    else if self.item == "clock" && (self.calendarMinute != Int(Date().timeIntervalSince1970 / 60) || self.calendarDirty) { self.loadCalendar() }
+                if kill(self.theme.barPID, 0) != 0 { NSApp.terminate(nil) }
+                guard self.panel.isVisible else { return }
+                switch self.item {
+                case .volume: self.refreshVolume()
+                case .network: self.refreshNetwork()
+                case .clock:
+                    if self.calendarMinute != Int(Date().timeIntervalSince1970 / 60) || self.calendarDirty { self.loadCalendar() }
+                case nil: break
                 }
             }
         }
@@ -289,14 +356,14 @@ final class Popups: NSObject, NSApplicationDelegate {
     @objc func receive(_ notification: Notification) {
         guard let item = notification.userInfo?["item"] as? String else { return }
         if item == "stop" { NSApp.terminate(nil) }
-        else { toggle(item) }
+        else if let popup = PopupKind(rawValue: item) { toggle(popup) }
     }
 
-    func queryAnchor(_ item: String) -> NSRect? {
+    func queryAnchor(_ item: PopupKind) -> NSRect? {
         let process = Process()
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: theme.environment["SB"]!)
-        process.arguments = ["--query", item]
+        process.executableURL = URL(fileURLWithPath: theme.sketchybarPath)
+        process.arguments = ["--query", item.rawValue]
         process.standardOutput = pipe
         do { try process.run() } catch { return nil }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -312,21 +379,21 @@ final class Popups: NSObject, NSApplicationDelegate {
         return NSRect(x: origin[0], y: screen.frame.maxY - origin[1] - size[1], width: size[0], height: size[1])
     }
 
-    func toggle(_ next: String) {
-        guard next == "volume" || next == "clock" || next == "network" else { return }
+    func toggle(_ next: PopupKind) {
         if item == next && panel.isVisible { close(); return }
         guard let rect = queryAnchor(next) else { close(); return }
         item = next
         anchor = rect
-        if next == "volume" {
+        switch next {
+        case .volume:
             buildVolume()
             panel.makeKeyAndOrderFront(nil)
             panel.makeFirstResponder(slider)
-        } else if next == "network" {
+        case .network:
             networkState = NetworkState.read()
             buildNetwork()
             panel.makeKeyAndOrderFront(nil)
-        } else {
+        case .clock:
             events = []
             calendarError = nil
             buildCalendar()
@@ -356,7 +423,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         } else {
             panel.contentView = view
         }
-        panel.title = item
+        panel.title = item?.rawValue ?? ""
         return view
     }
 
@@ -420,7 +487,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     func refreshVolume() {
-        guard item == "volume" else { return }
+        guard item == .volume else { return }
         if signature(Audio.devices()) != deviceSignature { buildVolume(); return }
         let id = Audio.current
         let value = Audio.volume(id)
@@ -478,22 +545,23 @@ final class Popups: NSObject, NSApplicationDelegate {
         view.addSubview(network)
     }
 
-    @objc func openWiFiSettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.wifi-settings-extension")!)
+    func openSettings(_ address: String) {
+        // Callers pass fixed System Settings URL literals. A parse failure is a programmer mistake.
+        guard let url = URL(string: address) else { preconditionFailure("Invalid System Settings URL: \(address)") }
+        NSWorkspace.shared.open(url)
         close()
     }
 
-    @objc func openNetworkSettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Network-Settings.extension")!)
-        close()
-    }
+    @objc func openWiFiSettings() { openSettings("x-apple.systempreferences:com.apple.wifi-settings-extension") }
+
+    @objc func openNetworkSettings() { openSettings("x-apple.systempreferences:com.apple.Network-Settings.extension") }
 
     @objc nonisolated func calendarChanged() {
         // EventKit can post from another thread. Only the UI update crosses actors.
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.calendarDirty = true
-            if self.panel.isVisible && self.item == "clock" { self.loadCalendar() }
+            if self.panel.isVisible && self.item == .clock { self.loadCalendar() }
         }
     }
 
@@ -517,7 +585,7 @@ final class Popups: NSObject, NSApplicationDelegate {
                 guard !Task.isCancelled else { return }
                 // The user may have switched or closed popups while permission was pending.
                 self.calendarDirty = true
-                if self.item == "clock" && self.panel.isVisible { self.loadCalendar() }
+                if self.item == .clock && self.panel.isVisible { self.loadCalendar() }
             }
             return
         }
@@ -526,7 +594,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         guard authorization == .fullAccess else {
             events = []
             calendarError = calendarError ?? NSError(domain: EKErrorDomain, code: EKError.Code.eventStoreNotAuthorized.rawValue)
-            if item == "clock" { buildCalendar() }
+            if item == .clock { buildCalendar() }
             return
         }
         calendarBusy = true
@@ -548,7 +616,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             .map { CalendarEvent(title: $0.title ?? "", start: $0.startDate, allDay: $0.isAllDay,
                                  calendar: $0.calendar.title, color: NSColor(cgColor: $0.calendar.cgColor) ?? .white) }
         calendarBusy = false
-        if item == "clock" { buildCalendar() }
+        if item == .clock { buildCalendar() }
     }
 
     func buildCalendar() {
@@ -637,14 +705,24 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc func openCalendarPrivacy() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars")!)
-        close()
-    }
+    @objc func openCalendarPrivacy() { openSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars") }
 
     @objc func changeVolume(_ sender: NSSlider) { perform { try Audio.setVolume(Float(sender.doubleValue / 100)) } }
     @objc func changeMute(_ sender: NSButton) { perform { try Audio.setMuted(sender.state == .on) } }
     @objc func changeDevice(_ sender: OutputButton) { perform { try Audio.select(sender.device) } }
+}
+
+// NSApplication.delegate is weak. This lazy process-lifetime owner keeps the UI
+// controller alive without constructing AppKit windows for the JSON commands.
+private enum PopupRuntime {
+    static let delegate: Popups = {
+        do { return Popups(theme: try Theme()) }
+        catch {
+            // ConfigurationError contains fixed key names, never environment values.
+            logger.error("Popup configuration failed: \(error.localizedDescription, privacy: .public)")
+            exit(EXIT_FAILURE)
+        }
+    }()
 }
 
 let arguments = CommandLine.arguments
@@ -658,16 +736,21 @@ if arguments.count > 1 && arguments[1] == "audio" {
 } else if arguments.count > 1 && arguments[1] == "stop" {
     DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": "stop"], deliverImmediately: true)
 } else {
+    let command = arguments.count > 1 ? arguments[1] : PopupKind.volume.rawValue
+    guard let popup = PopupKind(rawValue: command) else {
+        logger.error("Unknown popup command: \(command)")
+        exit(EXIT_FAILURE)
+    }
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
-    let delegate = Popups()
-    delegate.initialItem = arguments.count > 1 ? arguments[1] : "volume"
+    let delegate = PopupRuntime.delegate
+    delegate.initialItem = popup
     DistributedNotificationCenter.default().addObserver(delegate, selector: #selector(Popups.receive(_:)), name: Popups.notification, object: nil)
     // Lock the existing source inode, not a scratch file. The kernel releases it on exit.
-    delegate.lock = open(ProcessInfo.processInfo.environment["CONFIG_DIR"]! + "/plugins/popup.swift", O_RDONLY)
+    delegate.lock = open(delegate.theme.configDirectory + "/plugins/popup.swift", O_RDONLY)
     guard delegate.lock >= 0 else { exit(1) }
     if flock(delegate.lock, LOCK_EX | LOCK_NB) != 0 {
-        DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": delegate.initialItem], deliverImmediately: true)
+        DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": delegate.initialItem.rawValue], deliverImmediately: true)
         exit(0)
     }
     app.delegate = delegate
