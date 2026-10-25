@@ -1,0 +1,79 @@
+#!/bin/bash
+CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/sketchybar-next}"
+source "$CONFIG_DIR/theme.sh"
+P="$CONFIG_DIR/plugins"
+
+a=(--bar position=top height=30 margin=8 y_offset=8 corner_radius=12
+   color=$BAR_COLOR border_width=1 border_color=$BAR_EDGE blur_radius=0 shadow=on
+   padding_left=4 padding_right=4 display=main topmost=window)
+
+a+=(--default updates=when_shown
+    icon.font="$FONT:Medium:13.0" label.font="$FONT:Semibold:13.0"
+    icon.color=$TEXT2 label.color=$TEXT
+    icon.padding_left=0 icon.padding_right=0 label.padding_left=0 label.padding_right=0
+    padding_left=0 padding_right=0
+    background.height=22 background.corner_radius=8 background.color=$CLEAR)
+
+a+=(--add event aerospace_workspace_change
+    --add event aerospace_focus_change)
+
+gap() { a+=(--add item "$1" left --set "$1" width=$2); }
+
+first=1
+for ws in $(aerospace list-workspaces --all); do
+  [ $first = 1 ] || gap "ws.$ws.gap" 2
+  first=0
+  members=("ws.$ws")
+  a+=(--add item "ws.$ws" left
+      --set "ws.$ws" label="$ws" label.color=$TEXT3 label.padding_left=8 label.padding_right=8
+                     background.drawing=off click_script="aerospace workspace $ws")
+  for i in $(seq 0 $((MAX_APPS - 1))); do
+    members+=("ws.$ws.a$i")
+    a+=(--add item "ws.$ws.a$i" left
+        --set "ws.$ws.a$i" drawing=off width=0 background.drawing=on
+                           background.image.scale=$ICON_SCALE click_script="aerospace workspace $ws")
+  done
+  gap "ws.$ws.end" 0
+  members+=("ws.$ws.end")
+  a+=(--add bracket "ws.$ws.pill" "${members[@]}"
+      --set "ws.$ws.pill" background.color=$CLEAR background.height=22 background.corner_radius=8)
+done
+
+gap sep.l 6
+a+=(--add item sep left
+    --set sep width=1 background.drawing=on background.color=0x1fffffff background.height=14 background.corner_radius=0)
+gap sep.r 4
+
+a+=(--add item spaces left
+    --set spaces drawing=off updates=on script="$P/spaces.sh"
+    --subscribe spaces aerospace_workspace_change aerospace_focus_change front_app_switched space_windows_change system_woke
+
+    --add item front.icon left
+    --set front.icon width=$APP_SLOT background.drawing=on background.image.scale=$ICON_SCALE
+
+    --add item front left
+    --set front label.padding_left=4 label.padding_right=8 script="$P/hover.sh"
+    --subscribe front mouse.entered mouse.exited)
+
+# right side is added right to left
+a+=(--add item clock right
+    --set clock icon.color=$TEXT2 icon.font="$FONT:Medium:13.0" icon.padding_left=8 icon.padding_right=6 label.padding_right=8
+                update_freq=10 script="$P/status.sh"
+    --subscribe clock system_woke mouse.entered mouse.exited
+
+    --add item battery right
+    --set battery icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
+                  update_freq=120 script="$P/status.sh"
+    --subscribe battery power_source_change system_woke mouse.entered mouse.exited
+
+    --add item volume right
+    --set volume icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
+                 script="$P/status.sh"
+    --subscribe volume volume_change mouse.entered mouse.exited
+
+    --add item wifi right
+    --set wifi icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=30 script="$P/status.sh"
+    --subscribe wifi wifi_change system_woke mouse.entered mouse.exited)
+
+$SB "${a[@]}"
+$SB --update
