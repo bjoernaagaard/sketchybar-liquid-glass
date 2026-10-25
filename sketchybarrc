@@ -1,5 +1,5 @@
 #!/bin/bash
-CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/sketchybar-next}"
+CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/sketchybar-liquid-glass}"
 source "$CONFIG_DIR/theme.sh"
 P="$CONFIG_DIR/plugins"
 
