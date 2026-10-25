@@ -166,6 +166,12 @@ struct MediaTiming {
     }
 }
 
+struct PendingMediaSeek {
+    let position: Double
+    let requestedAt = Date()
+    let trackSignature: [String]
+}
+
 struct MediaSnapshot: Codable, Equatable {
     let title: String
     let artist: String
@@ -199,6 +205,10 @@ struct MediaSnapshot: Codable, Equatable {
             return name
         }
         return bundleIdentifier
+    }
+
+    var trackSignature: [String] {
+        [title, artist, bundleIdentifier]
     }
 
     var timing: MediaTiming? {
@@ -618,6 +628,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     var mediaElapsed: NSTextField?
     var mediaDuration: NSTextField?
     var mediaSeeking = false
+    var pendingMediaSeek: PendingMediaSeek?
     var initialItem = PopupKind.volume
     var initialCommand = PopupKind.volume.rawValue
     var hoverCanClose = false
@@ -770,6 +781,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     @objc func close() {
         hoverCanClose = false
         mediaSeeking = false
+        pendingMediaSeek = nil
         panel.orderOut(nil)
     }
 
@@ -978,21 +990,34 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func updateMediaTiming() {
         guard let timing = media?.timing else { return }
+        var elapsed = timing.elapsed
+        if let pending = pendingMediaSeek {
+            let age = Date().timeIntervalSince(pending.requestedAt)
+            let expected = min(timing.duration, pending.position + (media?.playing == true ? age : 0))
+            if pending.trackSignature != media?.trackSignature || age >= 3 {
+                pendingMediaSeek = nil
+            } else if abs(timing.elapsed - expected) <= 2 {
+                pendingMediaSeek = nil
+            } else {
+                elapsed = expected
+            }
+        }
         mediaSlider?.maxValue = timing.duration
         mediaDuration?.stringValue = MediaTiming.format(timing.duration)
         guard !mediaSeeking else { return }
-        mediaSlider?.doubleValue = timing.elapsed
-        mediaElapsed?.stringValue = MediaTiming.format(timing.elapsed)
-        mediaSlider?.setAccessibilityValue("\(MediaTiming.format(timing.elapsed)) of \(MediaTiming.format(timing.duration))")
+        mediaSlider?.doubleValue = elapsed
+        mediaElapsed?.stringValue = MediaTiming.format(elapsed)
+        mediaSlider?.setAccessibilityValue("\(MediaTiming.format(elapsed)) of \(MediaTiming.format(timing.duration))")
     }
 
     func seekMedia(to seconds: Double) {
         do {
             try Media.seek(to: seconds)
+            pendingMediaSeek = PendingMediaSeek(position: seconds, trackSignature: media?.trackSignature ?? [])
             trigger("media_change")
-            readMedia()
-            buildMedia()
+            updateMediaTiming()
         } catch {
+            pendingMediaSeek = nil
             readMedia()
             buildMedia()
             NSAlert(error: error).beginSheetModal(for: panel)
@@ -1000,6 +1025,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     func performMedia(_ action: MediaAction) {
+        pendingMediaSeek = nil
         do {
             try Media.perform(action)
             trigger("media_change")
@@ -1464,7 +1490,10 @@ final class Popups: NSObject, NSApplicationDelegate {
     @objc func seekMedia(_ sender: NSSlider) {
         guard media?.timing != nil else { return }
         let eventType = NSApp.currentEvent?.type
-        if eventType == .leftMouseDown { mediaSeeking = true }
+        if eventType == .leftMouseDown {
+            mediaSeeking = true
+            pendingMediaSeek = nil
+        }
         let seconds = min(sender.maxValue, max(0, sender.doubleValue))
         mediaElapsed?.stringValue = MediaTiming.format(seconds)
         mediaSlider?.setAccessibilityValue("\(MediaTiming.format(seconds)) of \(MediaTiming.format(sender.maxValue))")
