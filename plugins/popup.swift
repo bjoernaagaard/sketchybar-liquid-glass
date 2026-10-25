@@ -127,12 +127,14 @@ enum MediaError: LocalizedError {
     case missingCLI
     case commandFailed(String)
     case invalidOutput
+    case invalidPosition
 
     var errorDescription: String? {
         switch self {
         case .missingCLI: "The media-control command was not found on PATH."
         case .commandFailed(let message): message
         case .invalidOutput: "media-control returned information this helper cannot read."
+        case .invalidPosition: "The playback position is invalid."
         }
     }
 }
@@ -149,16 +151,34 @@ enum MediaAction: String {
     }
 }
 
+struct MediaTiming {
+    let elapsed: Double
+    let duration: Double
+
+    static func format(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded(.down))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let seconds = total % 60
+        return hours > 0
+            ? String(format: "%d:%02d:%02d", hours, minutes, seconds)
+            : String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
 struct MediaSnapshot: Codable, Equatable {
     let title: String
     let artist: String
     let bundleIdentifier: String
     let processIdentifier: Int32?
     let playing: Bool
+    let duration: Double?
+    let elapsedTime: Double?
+    let elapsedTimeNow: Double?
     let artworkData: Data?
 
     enum CodingKeys: String, CodingKey {
-        case title, artist, bundleIdentifier, processIdentifier, playing, artworkData
+        case title, artist, bundleIdentifier, processIdentifier, playing, duration, elapsedTime, elapsedTimeNow, artworkData
     }
 
     init(from decoder: any Decoder) throws {
@@ -168,6 +188,9 @@ struct MediaSnapshot: Codable, Equatable {
         bundleIdentifier = try values.decodeIfPresent(String.self, forKey: .bundleIdentifier) ?? ""
         processIdentifier = try values.decodeIfPresent(Int32.self, forKey: .processIdentifier)
         playing = try values.decodeIfPresent(Bool.self, forKey: .playing) ?? false
+        duration = try values.decodeIfPresent(Double.self, forKey: .duration)
+        elapsedTime = try values.decodeIfPresent(Double.self, forKey: .elapsedTime)
+        elapsedTimeNow = try values.decodeIfPresent(Double.self, forKey: .elapsedTimeNow)
         artworkData = try values.decodeIfPresent(Data.self, forKey: .artworkData)
     }
 
@@ -178,8 +201,14 @@ struct MediaSnapshot: Codable, Equatable {
         return bundleIdentifier
     }
 
+    var timing: MediaTiming? {
+        guard let duration, duration.isFinite, duration > 0, duration <= Double(Int.max),
+              let elapsed = elapsedTimeNow ?? elapsedTime, elapsed.isFinite, elapsed >= 0 else { return nil }
+        return MediaTiming(elapsed: min(elapsed, duration), duration: duration)
+    }
+
     var contentSignature: [String] {
-        [title, artist, bundleIdentifier, playing ? "playing" : "paused"]
+        [title, artist, bundleIdentifier, playing ? "playing" : "paused", timing == nil ? "untimed" : "timed"]
     }
 }
 
@@ -198,7 +227,7 @@ struct Media {
         let errors = Pipe()
         do { process.executableURL = try executable() }
         catch { throw error }
-        process.arguments = ["get"] + (artwork ? [] : ["--no-artwork"])
+        process.arguments = ["get", "--now"] + (artwork ? [] : ["--no-artwork"])
         process.standardOutput = output
         process.standardError = errors
         do { try process.run() }
@@ -216,11 +245,20 @@ struct Media {
     }
 
     static func perform(_ action: MediaAction) throws(MediaError) {
+        try run([action.argument], description: action.argument)
+    }
+
+    static func seek(to seconds: Double) throws(MediaError) {
+        guard seconds.isFinite, seconds >= 0 else { throw .invalidPosition }
+        try run(["seek", String(seconds)], description: "seek")
+    }
+
+    private static func run(_ arguments: [String], description: String) throws(MediaError) {
         let process = Process()
         let errors = Pipe()
         do { process.executableURL = try executable() }
         catch { throw error }
-        process.arguments = [action.argument]
+        process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
         process.standardError = errors
         do { try process.run() }
@@ -229,7 +267,7 @@ struct Media {
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
             let message = String(decoding: failure, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            throw .commandFailed(message.isEmpty ? "media-control \(action.argument) failed." : message)
+            throw .commandFailed(message.isEmpty ? "media-control \(description) failed." : message)
         }
     }
 }
@@ -576,6 +614,10 @@ final class Popups: NSObject, NSApplicationDelegate {
     var networkState: NetworkState?
     var media: MediaSnapshot?
     var mediaError: MediaError?
+    var mediaSlider: NSSlider?
+    var mediaElapsed: NSTextField?
+    var mediaDuration: NSTextField?
+    var mediaSeeking = false
     var initialItem = PopupKind.volume
     var initialCommand = PopupKind.volume.rawValue
     var hoverCanClose = false
@@ -727,6 +769,7 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     @objc func close() {
         hoverCanClose = false
+        mediaSeeking = false
         panel.orderOut(nil)
     }
 
@@ -847,16 +890,23 @@ final class Popups: NSObject, NSApplicationDelegate {
         readMedia()
         if previous != media?.contentSignature || previousError != mediaError?.localizedDescription {
             buildMedia()
+        } else {
+            updateMediaTiming()
         }
     }
 
     func buildMedia() {
+        mediaSeeking = false
+        mediaSlider = nil
+        mediaElapsed = nil
+        mediaDuration = nil
         let pad = theme.number("POPUP_PADDING")
         let width = theme.number("POPUP_WIDTH")
         let row = theme.number("POPUP_ROW")
         let artworkSize: CGFloat = 48
         let contentY = pad + row
-        let view = surface(height: pad * 2 + row * 2 + artworkSize + 16)
+        let timingHeight = media?.timing == nil ? 0 : row
+        let view = surface(height: pad * 2 + row * 2 + artworkSize + 16 + timingHeight)
         label("Now Playing", x: pad, y: pad, width: width - pad * 2 - 100, in: view)
         let application = label(media?.applicationName ?? "", x: width - pad - 100, y: pad, width: 100, color: "TEXT3", in: view)
         application.alignment = .right
@@ -882,7 +932,27 @@ final class Popups: NSObject, NSApplicationDelegate {
         label(title, x: textX, y: contentY + 2, width: textWidth, in: view)
         label(detail, x: textX, y: contentY + 26, width: textWidth, color: "TEXT2", in: view)
 
-        let controlsY = contentY + artworkSize + 12
+        let controlsY = contentY + artworkSize + 12 + timingHeight
+        if media?.timing != nil {
+            let timeWidth: CGFloat = 56
+            let progressY = contentY + artworkSize + 8
+            mediaElapsed = label("", x: pad, y: progressY, width: timeWidth, color: "TEXT2", in: view)
+            mediaDuration = label("", x: width - pad - timeWidth, y: progressY, width: timeWidth, color: "TEXT2", in: view)
+            mediaDuration?.alignment = .right
+            let timeFont = NSFont.monospacedDigitSystemFont(ofSize: theme.font.pointSize, weight: .semibold)
+            mediaElapsed?.font = timeFont
+            mediaDuration?.font = timeFont
+            let slider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: self, action: #selector(seekMedia(_:)))
+            slider.frame = NSRect(x: pad + timeWidth + 4, y: progressY,
+                                  width: width - pad * 2 - timeWidth * 2 - 8, height: 24)
+            slider.isContinuous = true
+            slider.trackFillColor = theme.color("TEXT")
+            slider.setAccessibilityLabel("Playback position")
+            slider.toolTip = "Drag to seek"
+            view.addSubview(slider)
+            mediaSlider = slider
+            updateMediaTiming()
+        }
         let buttonWidth: CGFloat = 64
         let spacing: CGFloat = 8
         let controlsWidth = buttonWidth * 3 + spacing * 2
@@ -904,6 +974,29 @@ final class Popups: NSObject, NSApplicationDelegate {
         control(media?.playing == true ? "pause.fill" : "play.fill", media?.playing == true ? "Pause" : "Play or pause",
                 x: startX + buttonWidth + spacing, action: #selector(playPauseMedia))
         control("forward.fill", "Next", x: startX + (buttonWidth + spacing) * 2, action: #selector(nextMedia))
+    }
+
+    func updateMediaTiming() {
+        guard let timing = media?.timing else { return }
+        mediaSlider?.maxValue = timing.duration
+        mediaDuration?.stringValue = MediaTiming.format(timing.duration)
+        guard !mediaSeeking else { return }
+        mediaSlider?.doubleValue = timing.elapsed
+        mediaElapsed?.stringValue = MediaTiming.format(timing.elapsed)
+        mediaSlider?.setAccessibilityValue("\(MediaTiming.format(timing.elapsed)) of \(MediaTiming.format(timing.duration))")
+    }
+
+    func seekMedia(to seconds: Double) {
+        do {
+            try Media.seek(to: seconds)
+            trigger("media_change")
+            readMedia()
+            buildMedia()
+        } catch {
+            readMedia()
+            buildMedia()
+            NSAlert(error: error).beginSheetModal(for: panel)
+        }
     }
 
     func performMedia(_ action: MediaAction) {
@@ -1368,6 +1461,18 @@ final class Popups: NSObject, NSApplicationDelegate {
     @objc func previousMedia() { performMedia(.previous) }
     @objc func playPauseMedia() { performMedia(.playPause) }
     @objc func nextMedia() { performMedia(.next) }
+    @objc func seekMedia(_ sender: NSSlider) {
+        guard media?.timing != nil else { return }
+        let eventType = NSApp.currentEvent?.type
+        if eventType == .leftMouseDown { mediaSeeking = true }
+        let seconds = min(sender.maxValue, max(0, sender.doubleValue))
+        mediaElapsed?.stringValue = MediaTiming.format(seconds)
+        mediaSlider?.setAccessibilityValue("\(MediaTiming.format(seconds)) of \(MediaTiming.format(sender.maxValue))")
+        let dragging = eventType == .leftMouseDown || eventType == .leftMouseDragged
+        guard !dragging else { return }
+        mediaSeeking = false
+        seekMedia(to: seconds)
+    }
 }
 
 // NSApplication.delegate is weak. This lazy process-lifetime owner keeps the UI
