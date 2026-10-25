@@ -59,7 +59,7 @@ a+=(--add item spaces left
 # right side is added right to left
 a+=(--add item clock right
     --set clock icon.color=$TEXT2 icon.font="$FONT:Medium:13.0" icon.padding_left=8 icon.padding_right=6 label.padding_right=8
-                update_freq=10 script="$PLUGIN_DIR/status.sh"
+                update_freq=10 script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh clock"
     --subscribe clock system_woke mouse.entered mouse.exited
 
     --add item battery right

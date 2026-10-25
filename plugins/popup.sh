@@ -6,16 +6,17 @@ HELPER="$PLUGIN_DIR/.popup-helper"
 
 if [ "$1" = build ]; then
   [ ! -x "$HELPER" ] || "$HELPER" stop
-  if [ ! -x "$HELPER" ] || [ "$PLUGIN_DIR/popup.swift" -nt "$HELPER" ]; then
+  if [ ! -x "$HELPER" ] || [ "$PLUGIN_DIR/popup.swift" -nt "$HELPER" ] || [ "$PLUGIN_DIR/popup-info.plist" -nt "$HELPER" ]; then
     trap 'rm -f "$PLUGIN_DIR/.popup-build"' EXIT
-    /usr/bin/xcrun swiftc -O "$PLUGIN_DIR/popup.swift" -o "$PLUGIN_DIR/.popup-build" || exit 1
+    /usr/bin/xcrun swiftc -O "$PLUGIN_DIR/popup.swift" -o "$PLUGIN_DIR/.popup-build" \
+      -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$PLUGIN_DIR/popup-info.plist" || exit 1
     mv "$PLUGIN_DIR/.popup-build" "$HELPER"
   fi
   exit 0
 fi
 
 export CONFIG_DIR TEXT TEXT2 TEXT3 BAR_COLOR BAR_EDGE
-export POPUP_RADIUS POPUP_WIDTH POPUP_GAP POPUP_PADDING POPUP_ROW
+export POPUP_RADIUS POPUP_WIDTH POPUP_GAP POPUP_PADDING POPUP_ROW CALENDAR_TODAY_SIZE
 export SB="$(command -v "$SB")"
 export POPUP_BAR_PID="$(pgrep -x sketchybar)"
 "$HELPER" "${1:-$NAME}" </dev/null >/dev/null 2>&1 &
