@@ -229,7 +229,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     var initialItem = "volume"
     var lock: Int32 = -1
     lazy var eventStore = EKEventStore()
-    let calendarQueue = DispatchQueue(label: "sketchybar.calendar")
+    var calendarAccessTask: Task<Void, Never>?
     var events: [CalendarEvent] = []
     var calendarBusy = false
     var calendarDirty = true
@@ -258,17 +258,32 @@ final class Popups: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(close), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(calendarChanged), name: .EKEventStoreChanged, object: nil)
-        timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            if let pid = Int32(self.theme.environment["POPUP_BAR_PID"] ?? ""), kill(pid, 0) != 0 { NSApp.terminate(nil) }
-            if self.panel.isVisible {
-                if self.item == "volume" { self.refreshVolume() }
-                else if self.item == "network" { self.refreshNetwork() }
-                else if self.item == "clock" && (self.calendarMinute != Int(Date().timeIntervalSince1970 / 60) || self.calendarDirty) { self.loadCalendar() }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            // This timer is installed only on RunLoop.main. Assert that SDK boundary.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if let pid = Int32(self.theme.environment["POPUP_BAR_PID"] ?? ""), kill(pid, 0) != 0 { NSApp.terminate(nil) }
+                if self.panel.isVisible {
+                    if self.item == "volume" { self.refreshVolume() }
+                    else if self.item == "network" { self.refreshNetwork() }
+                    else if self.item == "clock" && (self.calendarMinute != Int(Date().timeIntervalSince1970 / 60) || self.calendarDirty) { self.loadCalendar() }
+                }
             }
         }
-        RunLoop.main.add(timer!, forMode: .common)
+        self.timer = timer
+        RunLoop.main.add(timer, forMode: .common)
         toggle(initialItem)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        calendarAccessTask?.cancel()
+        calendarAccessTask = nil
+        timer?.invalidate()
+        for monitor in monitors { NSEvent.removeMonitor(monitor) }
+        monitors.removeAll()
+        NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        DistributedNotificationCenter.default().removeObserver(self)
     }
 
     @objc func receive(_ notification: Notification) {
@@ -473,8 +488,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         close()
     }
 
-    @objc func calendarChanged() {
-        DispatchQueue.main.async { [weak self] in
+    @objc nonisolated func calendarChanged() {
+        // EventKit can post from another thread. Only the UI update crosses actors.
+        Task { @MainActor [weak self] in
             guard let self else { return }
             self.calendarDirty = true
             if self.panel.isVisible && self.item == "clock" { self.loadCalendar() }
@@ -487,13 +503,21 @@ final class Popups: NSObject, NSApplicationDelegate {
         if authorization == .notDetermined && requestAccess {
             calendarBusy = true
             buildCalendar()
-            eventStore.requestFullAccessToEvents { [weak self] _, error in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    self.calendarBusy = false
+            // A permission request belongs to the app, not the currently open popup.
+            calendarAccessTask = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    _ = try await self.eventStore.requestFullAccessToEvents()
+                    self.calendarError = nil
+                } catch {
                     self.calendarError = error
-                    self.loadCalendar()
                 }
+                self.calendarBusy = false
+                self.calendarAccessTask = nil
+                guard !Task.isCancelled else { return }
+                // The user may have switched or closed popups while permission was pending.
+                self.calendarDirty = true
+                if self.item == "clock" && self.panel.isVisible { self.loadCalendar() }
             }
             return
         }
@@ -507,29 +531,24 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
         calendarBusy = true
         calendarError = nil
-        let store = eventStore
-        calendarQueue.async { [weak self] in
-            guard let self else { return }
-            let now = Date()
-            let calendar = Calendar.autoupdatingCurrent
-            let tomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now))!
-            let predicate = store.predicateForEvents(withStart: now, end: tomorrow, calendars: nil)
-            // EventKit expands recurring occurrences. Include ongoing and all-day events,
-            // but never cancelled, declined, or already-finished occurrences.
-            let events = store.events(matching: predicate)
-                .filter { event in
-                    event.endDate > now && event.startDate < tomorrow && event.status != .canceled &&
-                    !(event.attendees ?? []).contains { $0.isCurrentUser && $0.participantStatus == .declined }
-                }
-                .sorted { $0.startDate == $1.startDate ? ($0.title ?? "") < ($1.title ?? "") : $0.startDate < $1.startDate }
-                .map { CalendarEvent(title: $0.title ?? "", start: $0.startDate, allDay: $0.isAllDay,
-                                     calendar: $0.calendar.title, color: NSColor(cgColor: $0.calendar.cgColor) ?? .white) }
-            DispatchQueue.main.async {
-                self.events = events
-                self.calendarBusy = false
-                if self.item == "clock" { self.buildCalendar() }
+        // Keep the store and its events on the main actor; do not share EKEventStore
+        // with a dispatch queue. The UI consumes value snapshots, never EKEvent objects.
+        let now = Date()
+        let calendar = Calendar.autoupdatingCurrent
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now))!
+        let predicate = eventStore.predicateForEvents(withStart: now, end: tomorrow, calendars: nil)
+        // EventKit expands recurring occurrences. Include ongoing and all-day events,
+        // but never cancelled, declined, or already-finished occurrences.
+        events = eventStore.events(matching: predicate)
+            .filter { event in
+                event.endDate > now && event.startDate < tomorrow && event.status != .canceled &&
+                !(event.attendees ?? []).contains { $0.isCurrentUser && $0.participantStatus == .declined }
             }
-        }
+            .sorted { $0.startDate == $1.startDate ? ($0.title ?? "") < ($1.title ?? "") : $0.startDate < $1.startDate }
+            .map { CalendarEvent(title: $0.title ?? "", start: $0.startDate, allDay: $0.isAllDay,
+                                 calendar: $0.calendar.title, color: NSColor(cgColor: $0.calendar.cgColor) ?? .white) }
+        calendarBusy = false
+        if item == "clock" { buildCalendar() }
     }
 
     func buildCalendar() {

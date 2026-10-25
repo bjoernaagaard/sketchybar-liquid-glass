@@ -6,9 +6,15 @@ HELPER="$PLUGIN_DIR/.popup-helper"
 
 if [ "$1" = build ]; then
   [ ! -x "$HELPER" ] || "$HELPER" stop
-  if [ ! -x "$HELPER" ] || [ "$PLUGIN_DIR/popup.swift" -nt "$HELPER" ] || [ "$PLUGIN_DIR/popup-info.plist" -nt "$HELPER" ]; then
+  if [ ! -x "$HELPER" ] || [ "$PLUGIN_DIR/popup.swift" -nt "$HELPER" ] || [ "$PLUGIN_DIR/popup-info.plist" -nt "$HELPER" ] || [ "$PLUGIN_DIR/popup.sh" -nt "$HELPER" ]; then
     trap 'rm -f "$PLUGIN_DIR/.popup-build"' EXIT
-    /usr/bin/xcrun swiftc -O "$PLUGIN_DIR/popup.swift" -o "$PLUGIN_DIR/.popup-build" \
+    # Swift 6 includes three Approachable Concurrency features; enable the other two.
+    # This is an AppKit app module, so UI and model state default to the main actor.
+    /usr/bin/xcrun swiftc -O -swift-version 6 -strict-concurrency=complete \
+      -default-isolation MainActor \
+      -enable-upcoming-feature NonisolatedNonsendingByDefault \
+      -enable-upcoming-feature InferIsolatedConformances \
+      "$PLUGIN_DIR/popup.swift" -o "$PLUGIN_DIR/.popup-build" \
       -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$PLUGIN_DIR/popup-info.plist" || exit 1
     mv "$PLUGIN_DIR/.popup-build" "$HELPER"
   fi
