@@ -24,3 +24,10 @@ APP_SLOT=20      # 16 pt icon centered, so 2 pt on each side and 4 pt between ic
 NUM_GAP=4        # number to first icon: 4 + 2 = 6 pt
 PILL_END=6       # last icon to pill edge: 2 + 6 = 8 pt, the same as pill edge to number
 MAX_APPS=4
+
+# Native popups share the bar material without blur or size animation.
+POPUP_RADIUS=12
+POPUP_WIDTH=280
+POPUP_GAP=8
+POPUP_PADDING=16
+POPUP_ROW=32

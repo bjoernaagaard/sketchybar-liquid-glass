@@ -2,6 +2,7 @@
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/sketchybar}"
 source "$CONFIG_DIR/theme.sh"
 PLUGIN_DIR="$CONFIG_DIR/plugins"
+"$PLUGIN_DIR/popup.sh" build || exit 1
 
 a=(--bar position=top height=30 margin=8 y_offset=8 corner_radius=12
    color=$BAR_COLOR border_width=1 border_color=$BAR_EDGE blur_radius=0 shadow=on
@@ -68,8 +69,8 @@ a+=(--add item clock right
 
     --add item volume right
     --set volume icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
-                 script="$PLUGIN_DIR/status.sh"
-    --subscribe volume volume_change mouse.entered mouse.exited
+                 script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh volume" update_freq=2
+    --subscribe volume volume_change system_woke mouse.entered mouse.exited
 
     --add item wifi right
     --set wifi icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=30 script="$PLUGIN_DIR/status.sh"

@@ -8,10 +8,11 @@ case "$NAME" in
     ;;
 
   volume)
-    if [ "$SENDER" = volume_change ]; then
-      vol=$INFO; muted=false
-    else
-      IFS='|' read -r vol muted < <(osascript -e 'set v to get volume settings' -e 'return (output volume of v as text) & "|" & (output muted of v as text)')
+    IFS='|' read -r vol muted < <("$CONFIG_DIR/plugins/.popup-helper" audio | jq -r '[(.volume // "fixed"), .muted] | join("|")')
+    [ -n "$vol" ] || exit 1
+    if [ "$vol" = fixed ]; then
+      $SB --set volume icon=$'\xf4\x80\x8a\xa9' label=""
+      exit 0
     fi
     if [ "$muted" = true ] || [ "$vol" -eq 0 ]; then icon=$'\xf4\x80\x8a\xa3'
     elif [ "$vol" -lt 34 ]; then icon=$'\xf4\x80\x8a\xa5'
