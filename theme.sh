@@ -1,5 +1,5 @@
 #!/bin/bash
-SB="$CONFIG_DIR/bin/sketchybar-liquid-glass"
+SB=sketchybar
 FONT="SF Pro"
 
 TEXT=0xebffffff

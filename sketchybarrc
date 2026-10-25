@@ -1,7 +1,7 @@
 #!/bin/bash
-CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/sketchybar-liquid-glass}"
+CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/sketchybar}"
 source "$CONFIG_DIR/theme.sh"
-P="$CONFIG_DIR/plugins"
+PLUGIN_DIR="$CONFIG_DIR/plugins"
 
 a=(--bar position=top height=30 margin=8 y_offset=8 corner_radius=12
    color=$BAR_COLOR border_width=1 border_color=$BAR_EDGE blur_radius=0 shadow=on
@@ -45,34 +45,34 @@ a+=(--add item sep left
 gap sep.r 4
 
 a+=(--add item spaces left
-    --set spaces drawing=off updates=on script="$P/spaces.sh"
+    --set spaces drawing=off updates=on script="$PLUGIN_DIR/spaces.sh"
     --subscribe spaces aerospace_workspace_change aerospace_focus_change front_app_switched space_windows_change system_woke
 
     --add item front.icon left
     --set front.icon width=$APP_SLOT background.drawing=on background.image.scale=$ICON_SCALE
 
     --add item front left
-    --set front label.padding_left=4 label.padding_right=8 script="$P/hover.sh"
+    --set front label.padding_left=4 label.padding_right=8 script="$PLUGIN_DIR/hover.sh"
     --subscribe front mouse.entered mouse.exited)
 
 # right side is added right to left
 a+=(--add item clock right
     --set clock icon.color=$TEXT2 icon.font="$FONT:Medium:13.0" icon.padding_left=8 icon.padding_right=6 label.padding_right=8
-                update_freq=10 script="$P/status.sh"
+                update_freq=10 script="$PLUGIN_DIR/status.sh"
     --subscribe clock system_woke mouse.entered mouse.exited
 
     --add item battery right
     --set battery icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
-                  update_freq=120 script="$P/status.sh"
+                  update_freq=120 script="$PLUGIN_DIR/status.sh"
     --subscribe battery power_source_change system_woke mouse.entered mouse.exited
 
     --add item volume right
     --set volume icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
-                 script="$P/status.sh"
+                 script="$PLUGIN_DIR/status.sh"
     --subscribe volume volume_change mouse.entered mouse.exited
 
     --add item wifi right
-    --set wifi icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=30 script="$P/status.sh"
+    --set wifi icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=30 script="$PLUGIN_DIR/status.sh"
     --subscribe wifi wifi_change system_woke mouse.entered mouse.exited)
 
 $SB "${a[@]}"
