@@ -31,7 +31,7 @@ for ws in $(aerospace list-workspaces --all); do
   a+=(--add item "ws.$ws" left
       --set "ws.$ws" label="$ws" label.color=$TEXT3 label.padding_left=8 label.padding_right=8
                      background.drawing=off click_script="aerospace workspace $ws")
-  for i in $(seq 0 $((MAX_APPS - 1))); do
+  for ((i = 0; i < MAX_APPS; i++)); do
     members+=("ws.$ws.a$i")
     a+=(--add item "ws.$ws.a$i" left
         --set "ws.$ws.a$i" drawing=off width=0 background.drawing=on

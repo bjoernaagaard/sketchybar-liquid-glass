@@ -13,8 +13,13 @@ collapsing=()
 
 for ws in $(aerospace list-workspaces --all); do
   apps=()
-  while IFS= read -r id; do [ -n "$id" ] && apps+=("$id"); done \
-    < <(printf '%s\n' "$windows" | awk -F'|' -v w="$ws" '$1==w && !seen[$2]++ {print $2}' | head -n $MAX_APPS)
+  while IFS='|' read -r window_ws id; do
+    [ "$window_ws" = "$ws" ] && [ -n "$id" ] || continue
+    duplicate=0
+    for app in "${apps[@]}"; do [ "$app" = "$id" ] && duplicate=1 && break; done
+    [ "$duplicate" = 0 ] && apps+=("$id")
+    [ ${#apps[@]} -ge "$MAX_APPS" ] && break
+  done <<< "$windows"
   n=${#apps[@]}
 
   if [ "$ws" = "$focused" ] && [ "$n" -gt 0 ]; then
@@ -29,7 +34,7 @@ for ws in $(aerospace list-workspaces --all); do
     colors+=(--set "ws.$ws" label.color=$c --set "ws.$ws.pill" background.color=$CLEAR)
   fi
 
-  for i in $(seq 0 $((MAX_APPS - 1))); do
+  for ((i = 0; i < MAX_APPS; i++)); do
     item="ws.$ws.a$i"
     if [ "$i" -ge "$n" ]; then
       now+=(--set "$item" drawing=off width=0)
