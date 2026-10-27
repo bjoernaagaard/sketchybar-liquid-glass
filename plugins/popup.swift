@@ -11,6 +11,33 @@ enum PopupKind: String {
     case volume, clock, network, tailscale, media
 }
 
+// Commands for the running helper. Strings exist only at the shell and notification boundary.
+enum PopupCommand {
+    case toggle(PopupKind), hover, hoverEnd, start, stop
+
+    init?(_ raw: String) {
+        switch raw {
+        case "media-hover": self = .hover
+        case "media-hover-end": self = .hoverEnd
+        case "start": self = .start
+        case "stop": self = .stop
+        default:
+            guard let popup = PopupKind(rawValue: raw) else { return nil }
+            self = .toggle(popup)
+        }
+    }
+
+    var rawValue: String {
+        switch self {
+        case .toggle(let popup): popup.rawValue
+        case .hover: "media-hover"
+        case .hoverEnd: "media-hover-end"
+        case .start: "start"
+        case .stop: "stop"
+        }
+    }
+}
+
 enum NetworkKind: String, Codable {
     case ethernet, wifi, network, none
 }
@@ -181,10 +208,11 @@ struct MediaSnapshot: Codable, Equatable {
     let duration: Double?
     let elapsedTime: Double?
     let elapsedTimeNow: Double?
+    let timestamp: Date?
     let artworkData: Data?
 
     enum CodingKeys: String, CodingKey {
-        case title, artist, bundleIdentifier, processIdentifier, playing, duration, elapsedTime, elapsedTimeNow, artworkData
+        case title, artist, bundleIdentifier, processIdentifier, playing, duration, elapsedTime, elapsedTimeNow, timestamp, artworkData
     }
 
     init(from decoder: any Decoder) throws {
@@ -197,6 +225,7 @@ struct MediaSnapshot: Codable, Equatable {
         duration = try values.decodeIfPresent(Double.self, forKey: .duration)
         elapsedTime = try values.decodeIfPresent(Double.self, forKey: .elapsedTime)
         elapsedTimeNow = try values.decodeIfPresent(Double.self, forKey: .elapsedTimeNow)
+        timestamp = try values.decodeIfPresent(String.self, forKey: .timestamp).flatMap { try? Date($0, strategy: .iso8601) }
         artworkData = try values.decodeIfPresent(Data.self, forKey: .artworkData)
     }
 
@@ -213,8 +242,14 @@ struct MediaSnapshot: Codable, Equatable {
 
     var timing: MediaTiming? {
         guard let duration, duration.isFinite, duration > 0, duration <= Double(Int.max),
-              let elapsed = elapsedTimeNow ?? elapsedTime, elapsed.isFinite, elapsed >= 0 else { return nil }
+              let elapsed = elapsedTimeNow ?? elapsedTime.map(advanced), elapsed.isFinite, elapsed >= 0 else { return nil }
         return MediaTiming(elapsed: min(elapsed, duration), duration: duration)
+    }
+
+    // `get --now` estimates the position. A streamed update reports it as of `timestamp`.
+    private func advanced(_ elapsed: Double) -> Double {
+        guard playing, let timestamp else { return elapsed }
+        return elapsed + max(0, Date().timeIntervalSince(timestamp))
     }
 
     var contentSignature: [String] {
@@ -241,7 +276,8 @@ final class ProcessCapture {
         for process in running.values where process.isRunning { process.terminate() }
     }
 
-    func run(_ executable: URL, _ arguments: [String]) async throws -> Result {
+    // With `lines`, each complete stdout line goes to the handler instead of the result.
+    func run(_ executable: URL, _ arguments: [String], lines: ((Data) -> Void)? = nil) async throws -> Result {
         try Task.checkCancellation()
         let (events, continuation) = AsyncStream<Event>.makeStream()
         process.executableURL = executable
@@ -282,7 +318,13 @@ final class ProcessCapture {
         var status: Int32?
         for await event in events {
             switch event {
-            case .output(let bytes): data.append(bytes)
+            case .output(let bytes):
+                data.append(bytes)
+                while let lines, let end = data.firstIndex(of: UInt8(ascii: "\n")) {
+                    let line = Data(data[data.startIndex..<end])
+                    data.removeSubrange(data.startIndex...end)
+                    lines(line)
+                }
             case .error(let bytes): failure.append(bytes)
             case .outputEnd: outputEnded = true
             case .errorEnd: errorEnded = true
@@ -597,13 +639,14 @@ struct Theme {
         guard let pid = Int32(try required("POPUP_BAR_PID")), pid > 0 else { throw ConfigurationError.invalidValue("POPUP_BAR_PID") }
         barPID = pid
         var numbers: [String: CGFloat] = [:]
-        for name in ["POPUP_RADIUS", "POPUP_WIDTH", "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE"] {
+        for name in ["POPUP_RADIUS", "POPUP_WIDTH", "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE",
+                     "ISLAND_WING", "ISLAND_RADIUS", "ISLAND_RESPONSE"] {
             guard let value = Double(try required(name)), value.isFinite, value >= 0 else { throw ConfigurationError.invalidValue(name) }
             numbers[name] = CGFloat(value)
         }
         self.numbers = numbers
         var colors: [String: NSColor] = [:]
-        for name in ["TEXT", "TEXT2", "TEXT3", "BAR_COLOR", "BAR_EDGE"] {
+        for name in ["TEXT", "TEXT2", "TEXT3", "BAR_COLOR", "BAR_EDGE", "ISLAND_COLOR"] {
             let raw = try required(name)
             guard raw.hasPrefix("0x"), let value = UInt32(raw.dropFirst(2), radix: 16) else { throw ConfigurationError.invalidValue(name) }
             colors[name] = NSColor(srgbRed: CGFloat((value >> 16) & 255) / 255,
@@ -647,6 +690,428 @@ final class Surface: NSView {
     }
 }
 
+// A media-control stream line. `--no-diff` sends the whole snapshot each time.
+struct MediaStreamEvent: Decodable {
+    let payload: MediaSnapshot?
+}
+
+// The camera housing on the bar's display, in AppKit screen coordinates.
+struct Notch: Equatable {
+    let midX: CGFloat
+    let top: CGFloat
+    let width: CGFloat
+    let height: CGFloat
+
+    init?(screen: NSScreen) {
+        let height = screen.safeAreaInsets.top
+        guard height > 0, let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea else { return nil }
+        let width = screen.frame.width - left.width - right.width
+        guard width > 0 else { return nil }
+        midX = screen.frame.minX + left.width + width / 2
+        top = screen.frame.maxY
+        self.width = width
+        self.height = height
+    }
+
+    // SketchyBar's display=main is CGMainDisplayID, which AppKit lists first.
+    static var main: Notch? { NSScreen.screens.first.flatMap(Notch.init(screen:)) }
+}
+
+// A critically damped spring. A new target keeps the current value and velocity,
+// so a shrinking island can grow again without a jump.
+struct Spring {
+    var value: CGFloat
+    var velocity: CGFloat = 0
+    var target: CGFloat
+
+    init(_ value: CGFloat) { self.value = value; target = value }
+
+    mutating func step(_ seconds: CGFloat, response: CGFloat) {
+        guard response > 0 else { settle(); return }
+        let omega = 2 * .pi / response
+        let offset = value - target
+        let rate = velocity + omega * offset
+        let decay = exp(-omega * seconds)
+        value = target + (offset + rate * seconds) * decay
+        velocity = (rate - omega * (offset + rate * seconds)) * decay
+    }
+
+    mutating func settle() { value = target; velocity = 0 }
+
+    var settled: Bool { abs(value - target) < 0.25 && abs(velocity) < 2 }
+}
+
+final class IslandPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+// The island's black shape. The strip as tall as the notch sits on the black bar, so only
+// the part below the bar shows: concave fillets where it leaves the bar, then round corners.
+final class IslandView: NSView {
+    var stripHeight: CGFloat = 0
+    // Artwork and meter beside the notch. Other subviews hang below the strip.
+    let wings = NSView()
+    let fillet: CGFloat
+    let radius: CGFloat
+
+    init(color: NSColor, fillet: CGFloat, radius: CGFloat) {
+        self.fillet = fillet
+        self.radius = radius
+        super.init(frame: .zero)
+        wantsLayer = true
+        shape.fillColor = color.cgColor
+        addSubview(wings)
+    }
+    required init?(coder: NSCoder) { fatalError("IslandView is constructed in code, not decoded from an archive.") }
+
+    private var shape: CAShapeLayer {
+        guard let layer = layer as? CAShapeLayer else { preconditionFailure("makeBackingLayer returns a CAShapeLayer.") }
+        return layer
+    }
+
+    override func makeBackingLayer() -> CALayer { CAShapeLayer() }
+
+    override func setFrameSize(_ size: NSSize) {
+        super.setFrameSize(size)
+        arrange()
+    }
+
+    // Subviews stay centered on the notch and keep their distance from the top edge.
+    func arrange() {
+        let size = bounds.size
+        for view in subviews {
+            let top = view === wings ? 0 : stripHeight
+            view.setFrameOrigin(NSPoint(x: ((size.width - view.frame.width) / 2).rounded(), y: size.height - top - view.frame.height))
+        }
+        let path = CGMutablePath()
+        let width = size.width, height = size.height, junction = height - stripHeight
+        if junction < 0.5 {
+            path.addRect(CGRect(origin: .zero, size: size))
+        } else {
+            let curve = min(fillet, junction / 2)
+            let corner = max(0, min(radius, junction - curve, (width - fillet * 2) / 2))
+            path.move(to: CGPoint(x: 0, y: height))
+            path.addLine(to: CGPoint(x: width, y: height))
+            path.addLine(to: CGPoint(x: width, y: junction))
+            path.addQuadCurve(to: CGPoint(x: width - fillet, y: junction - curve), control: CGPoint(x: width - fillet, y: junction))
+            path.addArc(tangent1End: CGPoint(x: width - fillet, y: 0), tangent2End: CGPoint(x: fillet, y: 0), radius: corner)
+            path.addArc(tangent1End: CGPoint(x: fillet, y: 0), tangent2End: CGPoint(x: fillet, y: junction), radius: corner)
+            path.addLine(to: CGPoint(x: fillet, y: junction - curve))
+            path.addQuadCurve(to: CGPoint(x: 0, y: junction), control: CGPoint(x: fillet, y: junction))
+            path.closeSubpath()
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        shape.path = path
+        CATransaction.commit()
+    }
+}
+
+// Four bars beside the notch that move while media plays, like the island's waveform on iPhone.
+final class LevelMeter: NSView {
+    static let size = NSSize(width: 16, height: 12)
+    private var bars: [CALayer] = []
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        for index in 0..<4 {
+            let bar = CALayer()
+            bar.frame = CGRect(x: CGFloat(index) * 4.5, y: 0, width: 2.5, height: Self.size.height)
+            bar.cornerRadius = 1.25
+            layer?.addSublayer(bar)
+            bars.append(bar)
+        }
+    }
+    required init?(coder: NSCoder) { fatalError("LevelMeter is constructed in code, not decoded from an archive.") }
+
+    func update(playing: Bool, color: NSColor) {
+        let moving = playing && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        for (index, bar) in bars.enumerated() {
+            bar.backgroundColor = (playing ? color : color.withAlphaComponent(0.4)).cgColor
+            if moving {
+                guard bar.animation(forKey: "level") == nil else { continue }
+                bar.transform = CATransform3DIdentity
+                let level = CABasicAnimation(keyPath: "transform.scale.y")
+                level.fromValue = 0.3
+                level.toValue = 1
+                level.duration = [0.42, 0.56, 0.36, 0.5][index]
+                level.timeOffset = Double(index) * 0.17
+                level.autoreverses = true
+                level.repeatCount = .infinity
+                level.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                bar.add(level, forKey: "level")
+            } else {
+                bar.removeAnimation(forKey: "level")
+                bar.transform = CATransform3DMakeScale(1, playing ? 0.6 : 0.3, 1)
+            }
+        }
+    }
+}
+
+// On a notched display the camera housing is the media surface. While a player has a track,
+// wings beside the notch show its artwork and a level meter. Hovering grows the same black
+// shape down into the media popup, and closing shrinks it back. Without media it hides
+// behind the notch. Popups owns the island and decides what it shows when open.
+final class Island: NSObject {
+    private enum Shape { case hidden, compact, expanded }
+
+    let theme: Theme
+    unowned let popups: Popups
+    let panel = IslandPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+    private let view: IslandView
+    private var wings: NSView { view.wings }
+    private let artwork = NSImageView()
+    private let meter = LevelMeter(frame: NSRect(origin: .zero, size: LevelMeter.size))
+    private var content: NSView?
+    private(set) var notch: Notch?
+    private(set) var media: MediaSnapshot?
+    private var accent: NSColor
+    private var shape = Shape.hidden
+    private var width = Spring(0)
+    private var height = Spring(0)
+    private var link: CADisplayLink?
+    private var lastStep: CFTimeInterval?
+    private var stream: Task<Void, Never>?
+
+    init(theme: Theme, popups: Popups) {
+        self.theme = theme
+        self.popups = popups
+        accent = theme.color("TEXT")
+        view = IslandView(color: theme.color("ISLAND_COLOR"), fillet: theme.number("POPUP_GAP"), radius: theme.number("ISLAND_RADIUS"))
+        super.init()
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        // Above the bar and normal windows, below the bar popups.
+        panel.level = .statusBar
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.title = PopupKind.media.rawValue
+        panel.contentView = view
+        artwork.wantsLayer = true
+        artwork.layer?.cornerRadius = 5
+        artwork.layer?.masksToBounds = true
+        artwork.imageScaling = .scaleProportionallyUpOrDown
+        artwork.setAccessibilityLabel("Album artwork")
+        wings.addSubview(artwork)
+        wings.addSubview(meter)
+        wings.alphaValue = 0
+        view.setAccessibilityElement(true)
+        view.setAccessibilityRole(.group)
+        view.setAccessibilityLabel("Now Playing")
+        view.addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+    }
+
+    var isExpanded: Bool { shape == .expanded }
+
+    // Called at launch and whenever the displays change. Returns whether the bar layout must follow.
+    @discardableResult func updateNotch() -> Bool {
+        let next = Notch.main
+        guard next != notch else { return false }
+        notch = next
+        guard let next else {
+            stream?.cancel()
+            stream = nil
+            media = nil
+            stopLink()
+            shape = .hidden
+            content?.removeFromSuperview()
+            content = nil
+            panel.orderOut(nil)
+            return true
+        }
+        view.stripHeight = next.height
+        let wing = theme.number("ISLAND_WING")
+        let art = min(22, next.height - 10)
+        wings.frame.size = NSSize(width: next.width + wing * 2, height: next.height)
+        artwork.frame = NSRect(x: ((wing - art) / 2).rounded(), y: ((next.height - art) / 2).rounded(), width: art, height: art)
+        meter.setFrameOrigin(NSPoint(x: (wings.frame.width - wing + (wing - LevelMeter.size.width) / 2).rounded(),
+                                     y: ((next.height - LevelMeter.size.height) / 2).rounded()))
+        view.arrange()
+        let size = size(shape)
+        width = Spring(size.width)
+        height = Spring(size.height)
+        render()
+        startStream()
+        return true
+    }
+
+    func stop() {
+        stream?.cancel()
+        stream = nil
+        stopLink()
+    }
+
+    // Returns the view the media popup lays out in, below the notch.
+    func expand(height: CGFloat) -> NSView {
+        content?.removeFromSuperview()
+        let view = FlippedView(frame: NSRect(x: 0, y: 0, width: theme.number("POPUP_WIDTH"), height: height))
+        content = view
+        self.view.addSubview(view)
+        move(to: .expanded)
+        // Lays out the new content and carries over the fade of the content it replaced.
+        self.view.arrange()
+        render()
+        return view
+    }
+
+    func collapse() { move(to: media == nil ? .hidden : .compact) }
+
+    private func apply(_ snapshot: MediaSnapshot?) {
+        let next = snapshot?.title.isEmpty == false ? snapshot : nil
+        if next?.artworkData != media?.artworkData {
+            let image = next?.artworkData.flatMap(NSImage.init(data:))
+            artwork.image = image ?? NSImage(systemSymbolName: "music.note", accessibilityDescription: "No artwork")
+            artwork.contentTintColor = theme.color("TEXT2")
+            accent = image.flatMap(Self.accent) ?? theme.color("TEXT")
+        }
+        media = next
+        meter.update(playing: next?.playing == true, color: accent)
+        view.setAccessibilityValue(next.map { [$0.title, $0.artist].filter { !$0.isEmpty }.joined(separator: ", ") })
+        if shape != .expanded { collapse() }
+    }
+
+    // The artwork's average color, brightened so the meter reads on black like the iPhone waveform.
+    private static func accent(_ image: NSImage) -> NSColor? {
+        guard let pixel = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 1, bitsPerSample: 8, samplesPerPixel: 4,
+                                           hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 4, bitsPerPixel: 32),
+              let context = NSGraphicsContext(bitmapImageRep: pixel) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        image.draw(in: NSRect(x: 0, y: 0, width: 1, height: 1))
+        NSGraphicsContext.restoreGraphicsState()
+        guard let color = pixel.colorAt(x: 0, y: 0)?.usingColorSpace(.deviceRGB), color.saturationComponent > 0.15 else { return nil }
+        return NSColor(hue: color.hueComponent, saturation: min(1, color.saturationComponent * 1.2),
+                       brightness: max(0.8, color.brightnessComponent), alpha: 1)
+    }
+
+    private func startStream() {
+        guard stream == nil else { return }
+        stream = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    let executable = try Media.executable()
+                    _ = try await ProcessCapture().run(executable, ["stream", "--no-diff", "--debounce=100"]) { line in
+                        guard let event = try? JSONDecoder().decode(MediaStreamEvent.self, from: line) else { return }
+                        self?.apply(event.payload)
+                    }
+                } catch is CancellationError {
+                    return
+                } catch MediaError.missingCLI {
+                    logger.error("Island media stream needs media-control on PATH.")
+                    return
+                } catch {
+                    logger.error("Island media stream failed: \(error.localizedDescription, privacy: .private)")
+                }
+                // The stream ends when media-control or its system service restarts.
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    private func size(_ shape: Shape) -> NSSize {
+        guard let notch else { return .zero }
+        let fillet = theme.number("POPUP_GAP")
+        let compact = notch.width + theme.number("ISLAND_WING") * 2
+        switch shape {
+        case .hidden: return NSSize(width: notch.width + fillet * 2, height: notch.height)
+        case .compact: return NSSize(width: compact + fillet * 2, height: notch.height)
+        case .expanded:
+            return NSSize(width: max(compact, theme.number("POPUP_WIDTH")) + fillet * 2, height: notch.height + (content?.frame.height ?? 0))
+        }
+    }
+
+    private func move(to next: Shape) {
+        guard notch != nil else { return }
+        shape = next
+        if !panel.isVisible {
+            guard next != .hidden else { return }
+            let start = size(.hidden)
+            width = Spring(start.width)
+            height = Spring(start.height)
+            render()
+            panel.orderFrontRegardless()
+        }
+        let target = size(next)
+        width.target = target.width
+        height.target = target.height
+        if link == nil && width.settled && height.settled {
+            finish()
+            return
+        }
+        // Reduce Motion: the shape jumps and only the contents cross-fade.
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            width.settle()
+            height.settle()
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                render(fading: true)
+            }
+            finish()
+            return
+        }
+        guard link == nil else { return }
+        lastStep = nil
+        let link = view.displayLink(target: self, selector: #selector(step(_:)))
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    // The link runs on RunLoop.main, so AppKit calls this on the main actor.
+    @objc private func step(_ link: CADisplayLink) {
+        let seconds = lastStep.map { min(1 / 30, max(0, link.timestamp - $0)) } ?? 1 / 120
+        lastStep = link.timestamp
+        let response = theme.number("ISLAND_RESPONSE")
+        width.step(seconds, response: response)
+        height.step(seconds, response: response)
+        if width.settled && height.settled {
+            width.settle()
+            height.settle()
+            stopLink()
+            render()
+            finish()
+        } else {
+            render()
+        }
+    }
+
+    private func stopLink() {
+        link?.invalidate()
+        link = nil
+    }
+
+    private func finish() {
+        if shape == .hidden { panel.orderOut(nil) }
+        if shape != .expanded {
+            content?.removeFromSuperview()
+            content = nil
+        }
+    }
+
+    // Opacity follows the geometry, so an interrupted move never leaves contents out of step.
+    private func render(fading: Bool = false) {
+        guard let notch else { return }
+        panel.setFrame(NSRect(x: notch.midX - width.value / 2, y: notch.top - height.value, width: width.value, height: height.value), display: true)
+        let hidden = size(.hidden).width, compact = size(.compact).width
+        let open = content.map { min(1, max(0, (height.value - notch.height) / max(1, $0.frame.height))) } ?? 0
+        let grown = min(1, max(0, (width.value - hidden) / max(1, compact - hidden)))
+        (fading ? wings.animator() : wings).alphaValue = grown * max(0, 1 - open * 2)
+        if let content { (fading ? content.animator() : content).alphaValue = max(0, open * 2 - 1) }
+    }
+
+    @objc func mouseEntered(with event: NSEvent) { popups.show(.media) }
+
+    @objc func mouseExited(with event: NSEvent) { popups.islandExited() }
+}
+
 final class OutputButton: NSButton {
     var device: AudioObjectID = 0
 }
@@ -685,9 +1150,12 @@ final class Popups: NSObject, NSApplicationDelegate {
     var mediaDuration: NSTextField?
     var mediaSeeking = false
     var pendingMediaSeek: PendingMediaSeek?
-    var initialItem = PopupKind.volume
-    var initialCommand = PopupKind.volume.rawValue
+    var initialCommand = PopupCommand.toggle(.volume)
     var hoverCanClose = false
+    lazy var island = Island(theme: theme, popups: self)
+    // Media opened from the island grows out of the notch instead of using the popup panel.
+    var inIsland = false
+    var notchTask: Task<Void, Never>?
     var lock: Int32 = -1
     lazy var eventStore = EKEventStore()
     var calendarAccessTask: Task<Void, Never>?
@@ -707,6 +1175,11 @@ final class Popups: NSObject, NSApplicationDelegate {
         super.init()
     }
 
+    var popupWindow: NSPanel { inIsland ? island.panel : panel }
+
+    // The island panel stays on screen while compact, so visibility alone does not mean open.
+    var isOpen: Bool { item != nil && openingTask == nil && (inIsland ? island.isExpanded : panel.isVisible) }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -717,7 +1190,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         panel.isReleasedWhenClosed = false
         panel.appearance = NSAppearance(named: .darkAqua)
         if let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: { [weak self] _ in
-            guard let self, self.panel.isVisible || self.openingTask != nil else { return }
+            guard let self, self.isOpen || self.openingTask != nil else { return }
             // The source item must reach its click script so a second click toggles closed.
             if self.openingTask != nil {
                 let point = NSEvent.mouseLocation
@@ -735,14 +1208,14 @@ final class Popups: NSObject, NSApplicationDelegate {
         }) { monitors.append(monitor) }
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.willSleepNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(close), name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(calendarChanged), name: .EKEventStoreChanged, object: nil)
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             // This timer is installed only on RunLoop.main. Assert that SDK boundary.
             MainActor.assumeIsolated {
                 guard let self else { return }
                 if kill(self.theme.barPID, 0) != 0 { NSApp.terminate(nil) }
-                guard self.panel.isVisible else { return }
+                guard self.isOpen else { return }
                 switch self.item {
                 case .volume: self.refreshVolume()
                 case .network: self.refreshNetwork()
@@ -750,7 +1223,7 @@ final class Popups: NSObject, NSApplicationDelegate {
                 case .media:
                     self.refreshMedia()
                     let pointer = NSEvent.mouseLocation
-                    if self.hoverCanClose && !self.anchor.contains(pointer) && !self.panel.frame.contains(pointer) { self.close() }
+                    if self.hoverCanClose && !self.anchor.contains(pointer) && !self.popupWindow.frame.contains(pointer) { self.close() }
                 case .clock:
                     if self.calendarMinute != Int(Date().timeIntervalSince1970 / 60) || self.calendarDirty { self.loadCalendar() }
                 case nil: break
@@ -759,8 +1232,20 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
-        if initialCommand == "media-hover" { show(initialItem) }
-        else { toggle(initialItem) }
+        island.updateNotch()
+        switch initialCommand {
+        case .toggle(let popup): toggle(popup)
+        case .hover: show(.media)
+        case .start, .hoverEnd, .stop: break
+        }
+    }
+
+    @objc func screensChanged() {
+        close()
+        guard island.updateNotch() else { return }
+        // notch.sh moves the bar between its floating and notched layouts.
+        notchTask?.cancel()
+        notchTask = Task { [weak self] in await self?.trigger("notch_change") }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -771,6 +1256,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         mediaActionTasks.removeAll()
         tailscaleCommand?.cancel()
         tailscaleCommand = nil
+        notchTask?.cancel()
+        notchTask = nil
+        island.stop()
         ProcessCapture.terminateRunningChildren()
         timer?.invalidate()
         for monitor in monitors { NSEvent.removeMonitor(monitor) }
@@ -781,11 +1269,20 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     @objc func receive(_ notification: Notification) {
-        guard let item = notification.userInfo?["item"] as? String else { return }
-        if item == "stop" { NSApp.terminate(nil) }
-        else if item == "media-hover" { show(.media) }
-        else if item == "media-hover-end" { if self.item == .media { hoverCanClose = true } }
-        else if let popup = PopupKind(rawValue: item) { toggle(popup) }
+        guard let raw = notification.userInfo?["item"] as? String, let command = PopupCommand(raw) else { return }
+        switch command {
+        case .stop: NSApp.terminate(nil)
+        case .hover: show(.media)
+        case .hoverEnd: if item == .media { hoverCanClose = true }
+        case .start: break
+        case .toggle(let popup): toggle(popup)
+        }
+    }
+
+    func islandExited() {
+        guard item == .media, inIsland else { return }
+        hoverCanClose = true
+        if !island.panel.frame.contains(NSEvent.mouseLocation) { close() }
     }
 
     func queryAnchor(_ item: PopupKind) async -> NSRect? {
@@ -801,14 +1298,24 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     func show(_ next: PopupKind) {
-        if item == next && (panel.isVisible || openingTask != nil) { return }
+        if item == next && (isOpen || openingTask != nil) { return }
         toggle(next)
     }
 
     func toggle(_ next: PopupKind) {
-        if item == next && (panel.isVisible || openingTask != nil) { close(); return }
+        if item == next && (isOpen || openingTask != nil) { close(); return }
         close()
         item = next
+        // The island already holds the streamed snapshot, so it opens without waiting for a read.
+        if next == .media, island.notch != nil {
+            inIsland = true
+            anchor = island.panel.frame
+            media = island.media
+            mediaError = nil
+            buildMedia()
+            island.panel.makeKeyAndOrderFront(nil)
+            return
+        }
         openingHasAnchor = false
         openingTask = Task { [weak self] in
             guard let self else { return }
@@ -845,7 +1352,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             if next == .clock { self.loadCalendar(requestAccess: true) }
             if next == .media && self.hoverCanClose {
                 let pointer = NSEvent.mouseLocation
-                if !self.anchor.contains(pointer) && !self.panel.frame.contains(pointer) { self.close() }
+                if !self.anchor.contains(pointer) && !self.popupWindow.frame.contains(pointer) { self.close() }
             }
         }
     }
@@ -861,10 +1368,15 @@ final class Popups: NSObject, NSApplicationDelegate {
         hoverCanClose = false
         mediaSeeking = false
         pendingMediaSeek = nil
+        if inIsland {
+            inIsland = false
+            island.collapse()
+        }
         panel.orderOut(nil)
     }
 
-    func surface(height: CGFloat) -> Surface {
+    func surface(height: CGFloat) -> NSView {
+        if inIsland { return island.expand(height: height) }
         let width = theme.number("POPUP_WIDTH")
         let screen = NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.screens[0]
         let inset = theme.number("POPUP_GAP")
@@ -990,7 +1502,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             let previous = self.media?.contentSignature
             let previousError = self.mediaError?.localizedDescription
             await self.readMedia()
-            guard !Task.isCancelled, self.item == .media, self.panel.isVisible else { return }
+            guard !Task.isCancelled, self.item == .media, self.isOpen else { return }
             self.refreshTask = nil
             if previous != self.media?.contentSignature || previousError != self.mediaError?.localizedDescription {
                 self.buildMedia()
@@ -1114,7 +1626,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             guard let self else { return }
             defer {
                 self.mediaActionTasks[id] = nil
-                if self.mediaActionTasks.isEmpty && self.item == .media && self.panel.isVisible { self.refreshMedia() }
+                if self.mediaActionTasks.isEmpty && self.item == .media && self.isOpen { self.refreshMedia() }
             }
             guard !Task.isCancelled else { return }
             do {
@@ -1123,9 +1635,9 @@ final class Popups: NSObject, NSApplicationDelegate {
                 try await Media.seek(to: seconds)
                 await self.trigger("media_change")
             } catch {
-                guard !Task.isCancelled, self.item == .media, self.panel.isVisible else { return }
+                guard !Task.isCancelled, self.item == .media, self.isOpen else { return }
                 self.pendingMediaSeek = nil
-                NSAlert(error: error).beginSheetModal(for: self.panel, completionHandler: nil)
+                NSAlert(error: error).beginSheetModal(for: self.popupWindow, completionHandler: nil)
             }
         }
         mediaActionTask = task
@@ -1143,15 +1655,15 @@ final class Popups: NSObject, NSApplicationDelegate {
             guard let self else { return }
             defer {
                 self.mediaActionTasks[id] = nil
-                if self.mediaActionTasks.isEmpty && self.item == .media && self.panel.isVisible { self.refreshMedia() }
+                if self.mediaActionTasks.isEmpty && self.item == .media && self.isOpen { self.refreshMedia() }
             }
             guard !Task.isCancelled else { return }
             do {
                 try await Media.perform(action)
                 await self.trigger("media_change")
             } catch {
-                guard !Task.isCancelled, self.item == .media, self.panel.isVisible else { return }
-                NSAlert(error: error).beginSheetModal(for: self.panel, completionHandler: nil)
+                guard !Task.isCancelled, self.item == .media, self.isOpen else { return }
+                NSAlert(error: error).beginSheetModal(for: self.popupWindow, completionHandler: nil)
             }
         }
         mediaActionTask = task
@@ -1232,7 +1744,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let previous = self.tailscale
             await self.readTailscale()
-            guard !Task.isCancelled, self.item == .tailscale, self.panel.isVisible else { return }
+            guard !Task.isCancelled, self.item == .tailscale, self.isOpen else { return }
             self.refreshTask = nil
             if self.tailscaleLogin, case .success(let state) = self.tailscale, let url = URL(string: state.status.authURL),
                url.scheme == "https" {
@@ -1403,7 +1915,7 @@ final class Popups: NSObject, NSApplicationDelegate {
                 await self.trigger("tailscale_change")
                 guard !Task.isCancelled else { return }
                 self.tailscaleCommand = nil
-                guard self.item == .tailscale, self.panel.isVisible else { return }
+                guard self.item == .tailscale, self.isOpen else { return }
                 if result.status != 0 && result.status != SIGTERM {
                     self.tailscaleLogin = false
                     let message = Tailscale.message(result.errors)
@@ -1417,10 +1929,10 @@ final class Popups: NSObject, NSApplicationDelegate {
             } catch {
                 guard !Task.isCancelled else { return }
                 self.tailscaleCommand = nil
-                if self.item == .tailscale && self.panel.isVisible { NSAlert(error: error).beginSheetModal(for: self.panel, completionHandler: nil); self.buildTailscale() }
+                if self.item == .tailscale && self.isOpen { NSAlert(error: error).beginSheetModal(for: self.panel, completionHandler: nil); self.buildTailscale() }
             }
         }
-        if item == .tailscale && panel.isVisible { buildTailscale() }
+        if item == .tailscale && isOpen { buildTailscale() }
     }
 
     @objc func changeTailscaleRunning(_ sender: NSSwitch) { runTailscale([sender.state == .on ? "up" : "down"]) }
@@ -1456,7 +1968,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.calendarDirty = true
-            if self.panel.isVisible && self.item == .clock { self.loadCalendar() }
+            if self.isOpen && self.item == .clock { self.loadCalendar() }
         }
     }
 
@@ -1480,7 +1992,7 @@ final class Popups: NSObject, NSApplicationDelegate {
                 guard !Task.isCancelled else { return }
                 // The user may have switched or closed popups while permission was pending.
                 self.calendarDirty = true
-                if self.item == .clock && self.panel.isVisible { self.loadCalendar() }
+                if self.item == .clock && self.isOpen { self.loadCalendar() }
             }
             return
         }
@@ -1655,8 +2167,13 @@ if arguments.count > 1 && arguments[1] == "audio" {
     guard let state = NetworkState.read() else { exit(1) }
     let data = try JSONEncoder().encode(state)
     print(String(decoding: data, as: UTF8.self))
-} else if arguments.count > 1 && arguments[1] == "media-hover-end" {
-    DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": "media-hover-end"], deliverImmediately: true)
+} else if arguments.count > 1 && arguments[1] == "notch" {
+    // notch.sh reads this. null means the bar's display has no camera housing.
+    let size = Notch.main.map { ["width": Int($0.width.rounded()), "height": Int($0.height.rounded())] }
+    let data = try JSONEncoder().encode(size)
+    print(String(decoding: data, as: UTF8.self))
+} else if arguments.count > 1 && arguments[1] == PopupCommand.hoverEnd.rawValue {
+    DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": PopupCommand.hoverEnd.rawValue], deliverImmediately: true)
 } else if arguments.count > 1 && arguments[1] == "media-state" {
     runCLI {
         let snapshot = try await Media.read()
@@ -1674,26 +2191,33 @@ if arguments.count > 1 && arguments[1] == "audio" {
         let data = try await JSONEncoder().encode(["kind": Tailscale.kind()])
         print(String(decoding: data, as: UTF8.self))
     }
-} else if arguments.count > 1 && arguments[1] == "stop" {
-    DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": "stop"], deliverImmediately: true)
+} else if arguments.count > 1 && arguments[1] == PopupCommand.stop.rawValue {
+    DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": PopupCommand.stop.rawValue], deliverImmediately: true)
+    // sketchybarrc starts a helper right after this. Wait up to 2 s for the running one to
+    // release its lock, so that command is not handed to a process that is exiting.
+    guard let source = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("popup.swift") else { exit(EXIT_FAILURE) }
+    let lock = open(source.path, O_RDONLY)
+    var waits = 0
+    while lock >= 0, flock(lock, LOCK_EX | LOCK_NB) != 0, waits < 100 {
+        usleep(20_000)
+        waits += 1
+    }
 } else {
-    let command = arguments.count > 1 ? arguments[1] : PopupKind.volume.rawValue
-    let popup = command == "media-hover" ? PopupKind.media : PopupKind(rawValue: command)
-    guard let popup else {
-        logger.error("Unknown popup command: \(command)")
+    let raw = arguments.count > 1 ? arguments[1] : PopupKind.volume.rawValue
+    guard let command = PopupCommand(raw) else {
+        logger.error("Unknown popup command: \(raw)")
         exit(EXIT_FAILURE)
     }
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     let delegate = PopupRuntime.delegate
-    delegate.initialItem = popup
     delegate.initialCommand = command
     DistributedNotificationCenter.default().addObserver(delegate, selector: #selector(Popups.receive(_:)), name: Popups.notification, object: nil)
     // Lock the existing source inode, not a scratch file. The kernel releases it on exit.
     delegate.lock = open(delegate.theme.configDirectory + "/plugins/popup.swift", O_RDONLY)
     guard delegate.lock >= 0 else { exit(1) }
     if flock(delegate.lock, LOCK_EX | LOCK_NB) != 0 {
-        DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": delegate.initialCommand], deliverImmediately: true)
+        DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": command.rawValue], deliverImmediately: true)
         exit(0)
     }
     app.delegate = delegate
