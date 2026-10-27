@@ -968,11 +968,19 @@ final class Island: NSObject {
         return view
     }
 
-    func collapse() { move(to: media == nil ? .hidden : .compact) }
+    func collapse() {
+        // The island stays on screen, so ordering it out and back in hands the keyboard back
+        // to the frontmost app the way closing a bar popup does.
+        if panel.isKeyWindow {
+            panel.orderOut(nil)
+            panel.orderFrontRegardless()
+        }
+        move(to: media == nil ? .hidden : .compact)
+    }
 
     private func apply(_ snapshot: MediaSnapshot?) {
         let next = snapshot?.title.isEmpty == false ? snapshot : nil
-        if next?.artworkData != media?.artworkData {
+        if next?.artworkData != media?.artworkData || artwork.layer?.contents == nil {
             let image = next?.artworkData.flatMap(NSImage.init(data:))
             let placeholder = NSImage(systemSymbolName: "music.note", accessibilityDescription: nil)?
                 .withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [theme.color("TEXT2")]))
