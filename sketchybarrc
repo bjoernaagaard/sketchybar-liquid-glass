@@ -5,9 +5,8 @@ source "$CONFIG_DIR/theme.sh"
 PLUGIN_DIR="$CONFIG_DIR/plugins"
 "$PLUGIN_DIR/popup.sh" build || exit 1
 
-a=(--bar position=top height=30 margin=8 y_offset=8 corner_radius=12
-   color=$BAR_COLOR border_width=1 border_color=$BAR_EDGE blur_radius=0 shadow=on
-   padding_left=4 padding_right=4 display=main topmost=window)
+# notch.sh switches to BAR_NOTCH when the main display has a camera housing.
+a=(--bar position=top "${BAR_FLOAT[@]}" border_color=$BAR_EDGE blur_radius=0 display=main topmost=window)
 
 a+=(--default updates=when_shown
     icon.font="$FONT:Medium:13.0" label.font="$FONT:Semibold:13.0"
@@ -19,7 +18,8 @@ a+=(--default updates=when_shown
 a+=(--add event aerospace_workspace_change
     --add event aerospace_focus_change
     --add event tailscale_change
-    --add event media_change)
+    --add event media_change
+    --add event notch_change)
 
 gap() { a+=(--add item "$1" left --set "$1" width=$2); }
 
@@ -80,6 +80,10 @@ a+=(--add item clock right
                  update_freq=2 script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh media"
     --subscribe media media_change system_woke mouse.entered mouse.exited
 
+    --add item notch center
+    --set notch drawing=off updates=on script="$PLUGIN_DIR/notch.sh"
+    --subscribe notch notch_change system_woke
+
     --add item network right
     --set network icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=5 script="$PLUGIN_DIR/status.sh"
                   click_script="$PLUGIN_DIR/popup.sh network"
@@ -91,4 +95,6 @@ a+=(--add item clock right
     --subscribe tailscale tailscale_change wifi_change system_woke mouse.entered mouse.exited)
 
 $SB "${a[@]}"
+# The resident helper draws the island on a notched display and reports display changes.
+"$PLUGIN_DIR/popup.sh" start
 $SB --update
