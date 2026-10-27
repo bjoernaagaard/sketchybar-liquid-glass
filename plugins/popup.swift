@@ -276,6 +276,23 @@ final class ProcessCapture {
         for process in running.values where process.isRunning { process.terminate() }
     }
 
+    // Takes only the bytes that are ready. FileHandle.read(upToCount:) waits for the full
+    // count or EOF, and a process that streams sends neither.
+    nonisolated static func reader(_ continuation: AsyncStream<Event>.Continuation, _ descriptor: Int32,
+                                   bytes: @escaping @Sendable (Data) -> Event, end: Event) -> @Sendable (FileHandle) -> Void {
+        { handle in
+            var buffer = [UInt8](repeating: 0, count: 65536)
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            let code = errno
+            if count > 0 {
+                continuation.yield(bytes(Data(buffer[..<count])))
+            } else if count == 0 || (code != EAGAIN && code != EINTR) {
+                handle.readabilityHandler = nil
+                continuation.yield(count == 0 ? end : .readFailure(POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)))
+            }
+        }
+    }
+
     // With `lines`, each complete stdout line goes to the handler instead of the result.
     func run(_ executable: URL, _ arguments: [String], lines: ((Data) -> Void)? = nil) async throws -> Result {
         try Task.checkCancellation()
@@ -284,20 +301,10 @@ final class ProcessCapture {
         process.arguments = arguments
         process.standardOutput = output
         process.standardError = errors
-        output.fileHandleForReading.readabilityHandler = { handle in
-            do {
-                let data = try handle.read(upToCount: 65536) ?? Data()
-                if data.isEmpty { handle.readabilityHandler = nil; continuation.yield(.outputEnd) }
-                else { continuation.yield(.output(data)) }
-            } catch { handle.readabilityHandler = nil; continuation.yield(.readFailure(error)) }
-        }
-        errors.fileHandleForReading.readabilityHandler = { handle in
-            do {
-                let data = try handle.read(upToCount: 65536) ?? Data()
-                if data.isEmpty { handle.readabilityHandler = nil; continuation.yield(.errorEnd) }
-                else { continuation.yield(.error(data)) }
-            } catch { handle.readabilityHandler = nil; continuation.yield(.readFailure(error)) }
-        }
+        output.fileHandleForReading.readabilityHandler = Self.reader(continuation, output.fileHandleForReading.fileDescriptor,
+                                                                    bytes: Event.output, end: .outputEnd)
+        errors.fileHandleForReading.readabilityHandler = Self.reader(continuation, errors.fileHandleForReading.fileDescriptor,
+                                                                    bytes: Event.error, end: .errorEnd)
         process.terminationHandler = { process in continuation.yield(.exit(process.terminationStatus)) }
         defer {
             Self.running.removeValue(forKey: ObjectIdentifier(process))
@@ -866,7 +873,7 @@ final class Island: NSObject {
     let panel = IslandPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     private let view: IslandView
     private var wings: NSView { view.wings }
-    private let artwork = NSImageView()
+    private let artwork = NSView()
     private let meter = LevelMeter(frame: NSRect(origin: .zero, size: LevelMeter.size))
     private var content: NSView?
     private(set) var notch: Notch?
@@ -899,8 +906,6 @@ final class Island: NSObject {
         artwork.wantsLayer = true
         artwork.layer?.cornerRadius = 5
         artwork.layer?.masksToBounds = true
-        artwork.imageScaling = .scaleProportionallyUpOrDown
-        artwork.setAccessibilityLabel("Album artwork")
         wings.addSubview(artwork)
         wings.addSubview(meter)
         wings.alphaValue = 0
@@ -969,8 +974,12 @@ final class Island: NSObject {
         let next = snapshot?.title.isEmpty == false ? snapshot : nil
         if next?.artworkData != media?.artworkData {
             let image = next?.artworkData.flatMap(NSImage.init(data:))
-            artwork.image = image ?? NSImage(systemSymbolName: "music.note", accessibilityDescription: "No artwork")
-            artwork.contentTintColor = theme.color("TEXT2")
+            let placeholder = NSImage(systemSymbolName: "music.note", accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [theme.color("TEXT2")]))
+            // Fill the square like the iPhone island, so video thumbnails crop instead of letterboxing.
+            artwork.layer?.contentsGravity = image == nil ? .resizeAspect : .resizeAspectFill
+            artwork.layer?.contentsScale = panel.backingScaleFactor
+            artwork.layer?.contents = image ?? placeholder
             accent = image.flatMap(Self.accent) ?? theme.color("TEXT")
         }
         media = next
@@ -1107,9 +1116,10 @@ final class Island: NSObject {
         if let content { (fading ? content.animator() : content).alphaValue = max(0, open * 2 - 1) }
     }
 
-    @objc func mouseEntered(with event: NSEvent) { popups.show(.media) }
+    // The tracking area's owner is not a responder, so name the selectors AppKit sends.
+    @objc(mouseEntered:) func mouseEntered(with event: NSEvent) { popups.show(.media) }
 
-    @objc func mouseExited(with event: NSEvent) { popups.islandExited() }
+    @objc(mouseExited:) func mouseExited(with event: NSEvent) { popups.islandExited() }
 }
 
 final class OutputButton: NSButton {
