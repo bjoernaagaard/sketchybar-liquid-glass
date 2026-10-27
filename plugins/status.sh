@@ -5,12 +5,15 @@ if [ "$NAME" = media ]; then
     mouse.exited)  "$CONFIG_DIR/plugins/popup.sh" media-hover-end ;;
   esac
 fi
-"$CONFIG_DIR/plugins/hover.sh" && exit 0
+case "$SENDER" in
+  mouse.entered|mouse.exited) exec "$CONFIG_DIR/plugins/hover.sh" ;;
+esac
 source "$CONFIG_DIR/theme.sh"
 
 case "$NAME" in
   clock)
-    $SB --set clock icon="$(date '+%a %-d %b')" label="$(date '+%H:%M')"
+    IFS='|' read -r day time < <(date '+%a %-d %b|%H:%M')
+    $SB --set clock icon="$day" label="$time"
     ;;
 
   volume)
@@ -29,9 +32,9 @@ case "$NAME" in
 
   battery)
     batt=$(pmset -g batt)
-    pct=$(printf '%s' "$batt" | grep -Eo '[0-9]+%' | head -1 | tr -d %)
+    if [[ $batt =~ ([0-9]+)% ]]; then pct=${BASH_REMATCH[1]}; else pct=; fi
     if [ -z "$pct" ]; then $SB --set battery drawing=off; exit 0; fi
-    if printf '%s' "$batt" | grep -q 'AC Power'; then icon=$'\xf4\x80\xa2\x8b'
+    if [[ $batt == *'AC Power'* ]]; then icon=$'\xf4\x80\xa2\x8b'
     elif [ "$pct" -ge 88 ]; then icon=$'\xf4\x80\x9b\xa8'
     elif [ "$pct" -ge 63 ]; then icon=$'\xf4\x80\xba\xb8'
     elif [ "$pct" -ge 38 ]; then icon=$'\xf4\x80\xba\xb6'

@@ -222,6 +222,82 @@ struct MediaSnapshot: Codable, Equatable {
     }
 }
 
+// Owns the child and both pipes until their EOFs and termination have arrived.
+final class ProcessCapture {
+    nonisolated enum Event: Sendable {
+        case output(Data), error(Data), outputEnd, errorEnd, exit(Int32), readFailure(any Error)
+    }
+    nonisolated struct Result: Sendable {
+        let output: Data
+        let errors: Data
+        let status: Int32
+    }
+    let process = Process()
+    let output = Pipe()
+    let errors = Pipe()
+    private static var running: [ObjectIdentifier: Process] = [:]
+
+    static func terminateRunningChildren() {
+        for process in running.values where process.isRunning { process.terminate() }
+    }
+
+    func run(_ executable: URL, _ arguments: [String]) async throws -> Result {
+        try Task.checkCancellation()
+        let (events, continuation) = AsyncStream<Event>.makeStream()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = errors
+        output.fileHandleForReading.readabilityHandler = { handle in
+            do {
+                let data = try handle.read(upToCount: 65536) ?? Data()
+                if data.isEmpty { handle.readabilityHandler = nil; continuation.yield(.outputEnd) }
+                else { continuation.yield(.output(data)) }
+            } catch { handle.readabilityHandler = nil; continuation.yield(.readFailure(error)) }
+        }
+        errors.fileHandleForReading.readabilityHandler = { handle in
+            do {
+                let data = try handle.read(upToCount: 65536) ?? Data()
+                if data.isEmpty { handle.readabilityHandler = nil; continuation.yield(.errorEnd) }
+                else { continuation.yield(.error(data)) }
+            } catch { handle.readabilityHandler = nil; continuation.yield(.readFailure(error)) }
+        }
+        process.terminationHandler = { process in continuation.yield(.exit(process.terminationStatus)) }
+        defer {
+            Self.running.removeValue(forKey: ObjectIdentifier(process))
+            output.fileHandleForReading.readabilityHandler = nil
+            errors.fileHandleForReading.readabilityHandler = nil
+            process.terminationHandler = nil
+            if process.isRunning { process.terminate() }
+            try? output.fileHandleForReading.close()
+            try? errors.fileHandleForReading.close()
+            try? output.fileHandleForWriting.close()
+            try? errors.fileHandleForWriting.close()
+            continuation.finish()
+        }
+        try process.run()
+        Self.running[ObjectIdentifier(process)] = process
+        var data = Data(), failure = Data()
+        var outputEnded = false, errorEnded = false
+        var status: Int32?
+        for await event in events {
+            switch event {
+            case .output(let bytes): data.append(bytes)
+            case .error(let bytes): failure.append(bytes)
+            case .outputEnd: outputEnded = true
+            case .errorEnd: errorEnded = true
+            case .exit(let value): status = value
+            case .readFailure(let error): throw error
+            }
+            if outputEnded && errorEnded, let status {
+                try Task.checkCancellation()
+                return Result(output: data, errors: failure, status: status)
+            }
+        }
+        throw CancellationError()
+    }
+}
+
 struct Media {
     static func executable() throws(MediaError) -> URL {
         let paths = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
@@ -231,55 +307,42 @@ struct Media {
         return URL(fileURLWithPath: path)
     }
 
-    static func read(artwork: Bool = false) throws(MediaError) -> MediaSnapshot? {
-        let process = Process()
-        let output = Pipe()
-        let errors = Pipe()
-        do { process.executableURL = try executable() }
-        catch { throw error }
-        process.arguments = ["get", "--now"] + (artwork ? [] : ["--no-artwork"])
-        process.standardOutput = output
-        process.standardError = errors
-        do { try process.run() }
-        catch { throw .commandFailed(error.localizedDescription) }
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let failure = errors.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            let message = String(decoding: failure, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            throw .commandFailed(message.isEmpty ? "media-control get failed." : message)
+    static func read(artwork: Bool = false) async throws -> MediaSnapshot? {
+        let result: ProcessCapture.Result
+        do { result = try await ProcessCapture().run(executable(), ["get", "--now"] + (artwork ? [] : ["--no-artwork"])) }
+        catch is CancellationError { throw CancellationError() }
+        catch let error as MediaError { throw error }
+        catch { throw MediaError.commandFailed(error.localizedDescription) }
+        guard result.status == 0 else {
+            let message = String(decoding: result.errors, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw MediaError.commandFailed(message.isEmpty ? "media-control get failed." : message)
         }
-        guard !data.isEmpty else { return nil }
-        do { return try JSONDecoder().decode(MediaSnapshot?.self, from: data) }
-        catch { throw .invalidOutput }
+        guard !result.output.isEmpty else { return nil }
+        do { return try JSONDecoder().decode(MediaSnapshot?.self, from: result.output) }
+        catch { throw MediaError.invalidOutput }
     }
 
-    static func perform(_ action: MediaAction) throws(MediaError) {
-        try run([action.argument], description: action.argument)
+    static func perform(_ action: MediaAction) async throws {
+        try await run([action.argument], description: action.argument)
     }
 
-    static func seek(to seconds: Double) throws(MediaError) {
-        guard seconds.isFinite, seconds >= 0 else { throw .invalidPosition }
-        try run(["seek", String(seconds)], description: "seek")
+    static func seek(to seconds: Double) async throws {
+        guard seconds.isFinite, seconds >= 0 else { throw MediaError.invalidPosition }
+        try await run(["seek", String(seconds)], description: "seek")
     }
 
-    private static func run(_ arguments: [String], description: String) throws(MediaError) {
-        let process = Process()
-        let errors = Pipe()
-        do { process.executableURL = try executable() }
-        catch { throw error }
-        process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = errors
-        do { try process.run() }
-        catch { throw .commandFailed(error.localizedDescription) }
-        let failure = errors.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            let message = String(decoding: failure, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            throw .commandFailed(message.isEmpty ? "media-control \(description) failed." : message)
+    private static func run(_ arguments: [String], description: String) async throws {
+        let result: ProcessCapture.Result
+        do { result = try await ProcessCapture().run(executable(), arguments) }
+        catch is CancellationError { throw CancellationError() }
+        catch let error as MediaError { throw error }
+        catch { throw MediaError.commandFailed(error.localizedDescription) }
+        guard result.status == 0 else {
+            let message = String(decoding: result.errors, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw MediaError.commandFailed(message.isEmpty ? "media-control \(description) failed." : message)
         }
     }
+
 }
 
 struct NetworkConnection: Codable, Equatable {
@@ -467,50 +530,37 @@ struct Tailscale: Equatable {
             .joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // One CLI read. Starting several before collecting any lets them run side by side.
-    struct Read {
-        let arguments: [String]
-        let process = Process()
-        let output = Pipe()
-        let errors = Pipe()
-
-        init(_ arguments: [String]) throws {
-            self.arguments = arguments
-            process.executableURL = try executable()
-            process.arguments = arguments
-            process.standardOutput = output
-            process.standardError = errors
-            try process.run()
+    static func decode<T: Decodable>(_ type: T.Type, arguments: [String], result: ProcessCapture.Result) throws -> T {
+        guard result.status == 0 else {
+            let text = message(result.errors)
+            throw TailscaleError.commandFailed(text.isEmpty ? "tailscale \(arguments.joined(separator: " ")) failed." : text)
         }
-
-        func decode<T: Decodable>(_ type: T.Type) throws -> T {
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            let failure = errors.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
-                let text = message(failure)
-                throw TailscaleError.commandFailed(text.isEmpty ? "tailscale \(arguments.joined(separator: " ")) failed." : text)
-            }
-            do { return try JSONDecoder().decode(type, from: data) }
-            catch { throw TailscaleError.invalidOutput(arguments.joined(separator: " ")) }
-        }
+        do { return try JSONDecoder().decode(type, from: result.output) }
+        catch { throw TailscaleError.invalidOutput(arguments.joined(separator: " ")) }
     }
 
-    // Each read takes under 0.1 s, the same order as the bar query every popup already makes.
-    static func read() throws -> Tailscale {
-        let status = try Read(["status", "--json"])
-        let prefs = try Read(["debug", "prefs"])
-        return Tailscale(status: try status.decode(TailscaleStatus.self), prefs: try prefs.decode(TailscalePrefs.self))
+    static func read() async throws -> Tailscale {
+        let executable = try executable()
+        let statusCapture = ProcessCapture()
+        let prefsCapture = ProcessCapture()
+        async let statusResult = statusCapture.run(executable, ["status", "--json"])
+        async let prefsResult = prefsCapture.run(executable, ["debug", "prefs"])
+        let (status, prefs) = try await (statusResult, prefsResult)
+        return try Tailscale(status: decode(TailscaleStatus.self, arguments: ["status", "--json"], result: status),
+                             prefs: decode(TailscalePrefs.self, arguments: ["debug", "prefs"], result: prefs))
     }
 
-    static func kind() -> TailscaleKind {
-        guard let status = try? Read(["status", "--json"]).decode(TailscaleStatus.self) else { return .unavailable }
+    static func kind() async -> TailscaleKind {
+        guard let executable = try? executable(),
+              let result = try? await ProcessCapture().run(executable, ["status", "--json"]),
+              let status = try? decode(TailscaleStatus.self, arguments: ["status", "--json"], result: result) else { return .unavailable }
         switch status.backend {
         case .running: return status.peers.contains { $0.exitNode } ? .exitNode : .running
         case .needsLogin, .needsMachineAuth: return .login
         case .stopped, .starting, .noState: return .stopped
         }
     }
+
 }
 
 final class ValueButton: NSButton {
@@ -614,6 +664,12 @@ final class Popups: NSObject, NSApplicationDelegate {
     let theme: Theme
     let panel = PopupPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     var item: PopupKind?
+    var openingTask: Task<Void, Never>?
+    var refreshTask: Task<Void, Never>?
+    var mediaActionTask: Task<Void, Never>?
+    var mediaActionTasks: [UUID: Task<Void, Never>] = [:]
+    var openingClicks: [NSPoint] = []
+    var openingHasAnchor = false
     var anchor = NSRect.zero
     var monitors: [Any] = []
     var timer: Timer?
@@ -643,7 +699,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     var tailscale: Result<Tailscale, TailscaleError>?
     var tailscaleRead = Date.distantPast
     // One CLI write at a time. Its process is owned here and ended at shutdown.
-    var tailscaleCommand: Process?
+    var tailscaleCommand: Task<Void, Never>?
     var tailscaleLogin = false
 
     init(theme: Theme) {
@@ -661,9 +717,17 @@ final class Popups: NSObject, NSApplicationDelegate {
         panel.isReleasedWhenClosed = false
         panel.appearance = NSAppearance(named: .darkAqua)
         if let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: { [weak self] _ in
-            guard let self, self.panel.isVisible else { return }
+            guard let self, self.panel.isVisible || self.openingTask != nil else { return }
             // The source item must reach its click script so a second click toggles closed.
-            if !self.anchor.contains(NSEvent.mouseLocation) { self.close() }
+            if self.openingTask != nil {
+                let point = NSEvent.mouseLocation
+                if self.openingHasAnchor {
+                    if !self.anchor.contains(point) { self.close() }
+                } else { self.openingClicks.append(point) }
+            } else if !self.anchor.contains(NSEvent.mouseLocation) { self.close() }
+        }) { monitors.append(monitor) }
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
+            if event.keyCode == 53, self?.openingTask != nil { self?.close() }
         }) { monitors.append(monitor) }
         if let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
             if event.keyCode == 53 { self?.close(); return nil }
@@ -702,8 +766,12 @@ final class Popups: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         calendarAccessTask?.cancel()
         calendarAccessTask = nil
-        tailscaleCommand?.terminate()
+        close()
+        for task in mediaActionTasks.values { task.cancel() }
+        mediaActionTasks.removeAll()
+        tailscaleCommand?.cancel()
         tailscaleCommand = nil
+        ProcessCapture.terminateRunningChildren()
         timer?.invalidate()
         for monitor in monitors { NSEvent.removeMonitor(monitor) }
         monitors.removeAll()
@@ -720,65 +788,76 @@ final class Popups: NSObject, NSApplicationDelegate {
         else if let popup = PopupKind(rawValue: item) { toggle(popup) }
     }
 
-    func queryAnchor(_ item: PopupKind) -> NSRect? {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: theme.sketchybarPath)
-        process.arguments = ["--query", item.rawValue]
-        process.standardOutput = pipe
-        do { try process.run() } catch { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0,
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    func queryAnchor(_ item: PopupKind) async -> NSRect? {
+        guard let result = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath), ["--query", item.rawValue]),
+              result.status == 0,
+              let object = try? JSONSerialization.jsonObject(with: result.output) as? [String: Any],
               let rects = object["bounding_rects"] as? [String: [String: Any]],
               let rect = rects.sorted(by: { $0.key < $1.key }).first?.value,
               let origin = rect["origin"] as? [Double], let size = rect["size"] as? [Double],
               origin.count == 2, size.count == 2,
               let screen = NSScreen.screens.first else { return nil }
-        // SketchyBar uses top-left display coordinates; AppKit uses bottom-left.
         return NSRect(x: origin[0], y: screen.frame.maxY - origin[1] - size[1], width: size[0], height: size[1])
     }
 
     func show(_ next: PopupKind) {
-        hoverCanClose = false
-        if item == next && panel.isVisible { return }
+        if item == next && (panel.isVisible || openingTask != nil) { return }
         toggle(next)
     }
 
     func toggle(_ next: PopupKind) {
-        hoverCanClose = false
-        if item == next && panel.isVisible { close(); return }
-        guard let rect = queryAnchor(next) else { close(); return }
+        if item == next && (panel.isVisible || openingTask != nil) { close(); return }
+        close()
         item = next
-        anchor = rect
-        switch next {
-        case .volume:
-            buildVolume()
-            panel.makeKeyAndOrderFront(nil)
-            panel.makeFirstResponder(slider)
-        case .network:
-            networkState = NetworkState.read()
-            buildNetwork()
-            panel.makeKeyAndOrderFront(nil)
-        case .tailscale:
-            readTailscale()
-            buildTailscale()
-            panel.makeKeyAndOrderFront(nil)
-        case .media:
-            readMedia()
-            buildMedia()
-            panel.makeKeyAndOrderFront(nil)
-        case .clock:
-            events = []
-            calendarError = nil
-            buildCalendar()
-            panel.makeKeyAndOrderFront(nil)
-            loadCalendar(requestAccess: true)
+        openingHasAnchor = false
+        openingTask = Task { [weak self] in
+            guard let self else { return }
+            guard let rect = await self.queryAnchor(next), !Task.isCancelled else {
+                if !Task.isCancelled { self.close() }
+                return
+            }
+            self.anchor = rect
+            self.openingHasAnchor = true
+            guard self.openingClicks.allSatisfy({ rect.contains($0) }) else { self.close(); return }
+            self.openingClicks.removeAll()
+            switch next {
+            case .volume: self.buildVolume()
+            case .network:
+                self.networkState = NetworkState.read()
+                self.buildNetwork()
+            case .tailscale:
+                await self.readTailscale()
+                guard !Task.isCancelled else { return }
+                self.buildTailscale()
+            case .media:
+                await self.readMedia()
+                guard !Task.isCancelled else { return }
+                self.buildMedia()
+            case .clock:
+                self.events = []
+                self.calendarError = nil
+                self.buildCalendar()
+            }
+            guard !Task.isCancelled else { return }
+            self.openingTask = nil
+            self.panel.makeKeyAndOrderFront(nil)
+            if next == .volume { self.panel.makeFirstResponder(self.slider) }
+            if next == .clock { self.loadCalendar(requestAccess: true) }
+            if next == .media && self.hoverCanClose {
+                let pointer = NSEvent.mouseLocation
+                if !self.anchor.contains(pointer) && !self.panel.frame.contains(pointer) { self.close() }
+            }
         }
     }
 
     @objc func close() {
+        openingTask?.cancel()
+        openingTask = nil
+        openingClicks.removeAll()
+        openingHasAnchor = false
+        refreshTask?.cancel()
+        refreshTask = nil
+        item = nil
         hoverCanClose = false
         mediaSeeking = false
         pendingMediaSeek = nil
@@ -819,8 +898,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         return field
     }
 
-    func buildVolume() {
-        let devices = Audio.devices()
+    func buildVolume(devices: [(id: AudioObjectID, name: String)]? = nil, current: AudioObjectID? = nil) {
+        let devices = devices ?? Audio.devices()
+        let current = current ?? Audio.current
         let pad = theme.number("POPUP_PADDING")
         let width = theme.number("POPUP_WIDTH")
         let row = theme.number("POPUP_ROW")
@@ -845,32 +925,37 @@ final class Popups: NSObject, NSApplicationDelegate {
             let button = OutputButton(frame: NSRect(x: pad, y: pad + row * CGFloat(3 + index), width: width - pad * 2, height: row))
             button.device = device.id
             // U+2713 was checked against /Library/Fonts/SF-Pro.ttf (glyph 31267).
-            button.title = "\(device.id == Audio.current ? "✓" : "  ")  \(device.name)"
+            button.title = "\(device.id == current ? "✓" : "  ")  \(device.name)"
             button.font = theme.font
             button.alignment = .left
             button.bezelStyle = .inline
             button.isBordered = false
-            button.contentTintColor = theme.color(device.id == Audio.current ? "TEXT" : "TEXT2")
+            button.contentTintColor = theme.color(device.id == current ? "TEXT" : "TEXT2")
             button.lineBreakMode = .byTruncatingTail
             button.toolTip = device.name
             button.setAccessibilityLabel(device.name)
-            button.setAccessibilityValue(device.id == Audio.current ? 1 : 0)
+            button.setAccessibilityValue(device.id == current ? 1 : 0)
             button.target = self
             button.action = #selector(changeDevice(_:))
             view.addSubview(button)
         }
-        deviceSignature = signature(devices)
-        refreshVolume()
+        deviceSignature = signature(devices, current: current)
+        updateVolume(current)
     }
 
-    func signature(_ devices: [(id: AudioObjectID, name: String)]) -> String {
-        "\(Audio.current):" + devices.map { "\($0.id):\($0.name)" }.joined(separator: "|")
+    func signature(_ devices: [(id: AudioObjectID, name: String)], current: AudioObjectID) -> String {
+        "\(current):" + devices.map { "\($0.id):\($0.name)" }.joined(separator: "|")
     }
 
     func refreshVolume() {
         guard item == .volume else { return }
-        if signature(Audio.devices()) != deviceSignature { buildVolume(); return }
         let id = Audio.current
+        let devices = Audio.devices()
+        if signature(devices, current: id) != deviceSignature { buildVolume(devices: devices, current: id); return }
+        updateVolume(id)
+    }
+
+    func updateVolume(_ id: AudioObjectID) {
         let value = Audio.volume(id)
         slider?.isEnabled = value != nil
         if let value { slider?.doubleValue = Double(value * 100) }
@@ -882,28 +967,34 @@ final class Popups: NSObject, NSApplicationDelegate {
     func perform(_ action: () throws -> Void) {
         do { try action() }
         catch { NSAlert(error: error).beginSheetModal(for: panel) }
-        refreshVolume()
+        updateVolume(Audio.current)
     }
 
-    func readMedia() {
+    func readMedia() async {
         do {
-            media = try Media.read(artwork: true)
+            let snapshot = try await Media.read(artwork: true)
+            guard !Task.isCancelled else { return }
+            media = snapshot
             mediaError = nil
         } catch {
+            guard !Task.isCancelled else { return }
             media = nil
-            mediaError = error
+            mediaError = error as? MediaError ?? .commandFailed(error.localizedDescription)
         }
     }
 
     func refreshMedia() {
-        guard item == .media else { return }
-        let previous = media?.contentSignature
-        let previousError = mediaError?.localizedDescription
-        readMedia()
-        if previous != media?.contentSignature || previousError != mediaError?.localizedDescription {
-            buildMedia()
-        } else {
-            updateMediaTiming()
+        guard item == .media, refreshTask == nil, mediaActionTasks.isEmpty else { return }
+        refreshTask = Task { [weak self] in
+            guard let self else { return }
+            let previous = self.media?.contentSignature
+            let previousError = self.mediaError?.localizedDescription
+            await self.readMedia()
+            guard !Task.isCancelled, self.item == .media, self.panel.isVisible else { return }
+            self.refreshTask = nil
+            if previous != self.media?.contentSignature || previousError != self.mediaError?.localizedDescription {
+                self.buildMedia()
+            } else { self.updateMediaTiming() }
         }
     }
 
@@ -1011,37 +1102,64 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     func seekMedia(to seconds: Double) {
-        do {
-            try Media.seek(to: seconds)
-            pendingMediaSeek = PendingMediaSeek(position: seconds, trackSignature: media?.trackSignature ?? [])
-            trigger("media_change")
-            updateMediaTiming()
-        } catch {
-            pendingMediaSeek = nil
-            readMedia()
-            buildMedia()
-            NSAlert(error: error).beginSheetModal(for: panel)
+        refreshTask?.cancel()
+        refreshTask = nil
+        let signature = media?.trackSignature ?? []
+        pendingMediaSeek = PendingMediaSeek(position: seconds, trackSignature: signature)
+        updateMediaTiming()
+        let previous = mediaActionTask
+        let id = UUID()
+        let task = Task { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            defer {
+                self.mediaActionTasks[id] = nil
+                if self.mediaActionTasks.isEmpty && self.item == .media && self.panel.isVisible { self.refreshMedia() }
+            }
+            guard !Task.isCancelled else { return }
+            do {
+                let current = try await Media.read()
+                guard !Task.isCancelled, current?.trackSignature == signature else { return }
+                try await Media.seek(to: seconds)
+                await self.trigger("media_change")
+            } catch {
+                guard !Task.isCancelled, self.item == .media, self.panel.isVisible else { return }
+                self.pendingMediaSeek = nil
+                NSAlert(error: error).beginSheetModal(for: self.panel, completionHandler: nil)
+            }
         }
+        mediaActionTask = task
+        mediaActionTasks[id] = task
     }
 
     func performMedia(_ action: MediaAction) {
         pendingMediaSeek = nil
-        do {
-            try Media.perform(action)
-            trigger("media_change")
-            readMedia()
-            buildMedia()
-        } catch {
-            NSAlert(error: error).beginSheetModal(for: panel)
+        refreshTask?.cancel()
+        refreshTask = nil
+        let previous = mediaActionTask
+        let id = UUID()
+        let task = Task { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            defer {
+                self.mediaActionTasks[id] = nil
+                if self.mediaActionTasks.isEmpty && self.item == .media && self.panel.isVisible { self.refreshMedia() }
+            }
+            guard !Task.isCancelled else { return }
+            do {
+                try await Media.perform(action)
+                await self.trigger("media_change")
+            } catch {
+                guard !Task.isCancelled, self.item == .media, self.panel.isVisible else { return }
+                NSAlert(error: error).beginSheetModal(for: self.panel, completionHandler: nil)
+            }
         }
+        mediaActionTask = task
+        mediaActionTasks[id] = task
     }
 
-    func trigger(_ event: String) {
-        let bar = Process()
-        bar.executableURL = URL(fileURLWithPath: theme.sketchybarPath)
-        bar.arguments = ["--trigger", event]
-        try? bar.run()
-        bar.waitUntilExit()
+    func trigger(_ event: String) async {
+        _ = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath), ["--trigger", event])
     }
 
     func refreshNetwork() {
@@ -1096,26 +1214,35 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     @objc func openNetworkSettings() { openSettings("x-apple.systempreferences:com.apple.Network-Settings.extension") }
 
-    func readTailscale() {
+    func readTailscale() async {
         tailscaleRead = Date()
-        do { tailscale = .success(try Tailscale.read()) }
-        catch let error as TailscaleError { tailscale = .failure(error) }
-        catch { tailscale = .failure(.commandFailed(error.localizedDescription)) }
+        do {
+            let state = try await Tailscale.read()
+            guard !Task.isCancelled else { return }
+            tailscale = .success(state)
+        } catch {
+            guard !Task.isCancelled else { return }
+            tailscale = .failure(error as? TailscaleError ?? .commandFailed(error.localizedDescription))
+        }
     }
 
     func refreshTailscale() {
-        guard item == .tailscale else { return }
-        let previous = tailscale
-        readTailscale()
-        if tailscaleLogin, case .success(let state) = tailscale, let url = URL(string: state.status.authURL),
-           url.scheme == "https" {
-            // `tailscale login` publishes the URL in status. Open it once, as the official app does.
-            tailscaleLogin = false
-            NSWorkspace.shared.open(url)
-            close()
-            return
+        guard item == .tailscale, refreshTask == nil else { return }
+        refreshTask = Task { [weak self] in
+            guard let self else { return }
+            let previous = self.tailscale
+            await self.readTailscale()
+            guard !Task.isCancelled, self.item == .tailscale, self.panel.isVisible else { return }
+            self.refreshTask = nil
+            if self.tailscaleLogin, case .success(let state) = self.tailscale, let url = URL(string: state.status.authURL),
+               url.scheme == "https" {
+                self.tailscaleLogin = false
+                NSWorkspace.shared.open(url)
+                self.close()
+                return
+            }
+            if !self.sameTailscale(previous, self.tailscale) { self.buildTailscale() }
         }
-        if !sameTailscale(previous, tailscale) { buildTailscale() }
     }
 
     func sameTailscale(_ a: Result<Tailscale, TailscaleError>?, _ b: Result<Tailscale, TailscaleError>?) -> Bool {
@@ -1268,38 +1395,32 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func runTailscale(_ arguments: [String]) {
         guard tailscaleCommand == nil else { return }
-        let process = Process()
-        let errors = Pipe()
-        do { process.executableURL = try Tailscale.executable() }
-        catch { NSAlert(error: error).beginSheetModal(for: panel); return }
-        process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = errors
-        // Foundation calls this on its own thread. Only the result crosses to the main actor.
-        process.terminationHandler = { [weak self] process in
-            let status = process.terminationStatus
-            let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-            Task { @MainActor [weak self] in self?.finishTailscale(process, status: status, errors: errorData) }
+        tailscaleCommand = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await ProcessCapture().run(Tailscale.executable(), arguments)
+                guard !Task.isCancelled else { return }
+                await self.trigger("tailscale_change")
+                guard !Task.isCancelled else { return }
+                self.tailscaleCommand = nil
+                guard self.item == .tailscale, self.panel.isVisible else { return }
+                if result.status != 0 && result.status != SIGTERM {
+                    self.tailscaleLogin = false
+                    let message = Tailscale.message(result.errors)
+                    NSAlert(error: TailscaleError.commandFailed(message.isEmpty ? "tailscale exited with status \(result.status)." : message))
+                        .beginSheetModal(for: self.panel, completionHandler: nil)
+                }
+                self.refreshTask?.cancel()
+                self.refreshTask = nil
+                self.refreshTailscale()
+                self.buildTailscale()
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.tailscaleCommand = nil
+                if self.item == .tailscale && self.panel.isVisible { NSAlert(error: error).beginSheetModal(for: self.panel, completionHandler: nil); self.buildTailscale() }
+            }
         }
-        do { try process.run() }
-        catch { NSAlert(error: error).beginSheetModal(for: panel); return }
-        tailscaleCommand = process
         if item == .tailscale && panel.isVisible { buildTailscale() }
-    }
-
-    func finishTailscale(_ process: Process, status: Int32, errors: Data) {
-        guard tailscaleCommand === process else { return }
-        tailscaleCommand = nil
-        trigger("tailscale_change")
-        guard item == .tailscale && panel.isVisible else { return }
-        if status != 0 && status != SIGTERM {
-            tailscaleLogin = false
-            let message = Tailscale.message(errors)
-            NSAlert(error: TailscaleError.commandFailed(message.isEmpty ? "tailscale exited with status \(status)." : message))
-                .beginSheetModal(for: panel)
-        }
-        readTailscale()
-        buildTailscale()
     }
 
     @objc func changeTailscaleRunning(_ sender: NSSwitch) { runTailscale([sender.state == .on ? "up" : "down"]) }
@@ -1483,7 +1604,7 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     @objc func changeVolume(_ sender: NSSlider) { perform { try Audio.setVolume(Float(sender.doubleValue / 100)) } }
     @objc func changeMute(_ sender: NSButton) { perform { try Audio.setMuted(sender.state == .on) } }
-    @objc func changeDevice(_ sender: OutputButton) { perform { try Audio.select(sender.device) } }
+    @objc func changeDevice(_ sender: OutputButton) { perform { try Audio.select(sender.device) }; refreshVolume() }
     @objc func previousMedia() { performMedia(.previous) }
     @objc func playPauseMedia() { performMedia(.playPause) }
     @objc func nextMedia() { performMedia(.next) }
@@ -1517,6 +1638,15 @@ private enum PopupRuntime {
     }()
 }
 
+func runCLI(_ operation: @escaping () async throws -> Void) -> Never {
+    Task {
+        do { try await operation(); exit(EXIT_SUCCESS) }
+        catch { logger.error("Command failed: \(error.localizedDescription, privacy: .private)"); exit(EXIT_FAILURE) }
+    }
+    RunLoop.main.run()
+    exit(EXIT_FAILURE)
+}
+
 let arguments = CommandLine.arguments
 if arguments.count > 1 && arguments[1] == "audio" {
     let data = try JSONSerialization.data(withJSONObject: Audio.snapshot(), options: [.sortedKeys])
@@ -1528,18 +1658,22 @@ if arguments.count > 1 && arguments[1] == "audio" {
 } else if arguments.count > 1 && arguments[1] == "media-hover-end" {
     DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": "media-hover-end"], deliverImmediately: true)
 } else if arguments.count > 1 && arguments[1] == "media-state" {
-    let snapshot = try Media.read()
-    let data = try JSONEncoder().encode(snapshot)
-    print(String(decoding: data, as: UTF8.self))
+    runCLI {
+        let snapshot = try await Media.read()
+        let data = try JSONEncoder().encode(snapshot)
+        print(String(decoding: data, as: UTF8.self))
+    }
 } else if arguments.count > 2 && arguments[1] == "media" {
     guard let action = MediaAction(rawValue: arguments[2]) else {
         logger.error("Unknown media command: \(arguments[2])")
         exit(EXIT_FAILURE)
     }
-    try Media.perform(action)
+    runCLI { try await Media.perform(action) }
 } else if arguments.count > 1 && arguments[1] == "tailscale-state" {
-    let data = try JSONEncoder().encode(["kind": Tailscale.kind()])
-    print(String(decoding: data, as: UTF8.self))
+    runCLI {
+        let data = try await JSONEncoder().encode(["kind": Tailscale.kind()])
+        print(String(decoding: data, as: UTF8.self))
+    }
 } else if arguments.count > 1 && arguments[1] == "stop" {
     DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": "stop"], deliverImmediately: true)
 } else {
