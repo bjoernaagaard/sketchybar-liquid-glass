@@ -2,21 +2,26 @@
 import AppKit
 import CoreAudio
 import EventKit
+import IOKit
 import SystemConfiguration
 import os
 
 private let logger = Logger(subsystem: "com.bjoernaagaard.sketchybar", category: "popup")
 
 enum PopupKind: String {
-    case volume, clock, network, tailscale, media
+    case volume, clock, network, tailscale, media, system
 }
 
 // Commands for the running helper. Strings exist only at the shell and notification boundary.
 enum PopupCommand {
-    case toggle(PopupKind), hover, hoverEnd, start, stop
+    case toggle(PopupKind), hover, hoverEnd, start, stop, volumeScroll(notches: Int)
 
-    init?(_ raw: String) {
+    init?(_ raw: String, argument: String? = nil) {
         switch raw {
+        case "volume-scroll":
+            // status.sh passes SketchyBar's SCROLL_DELTA.
+            guard let argument, let delta = Double(argument), delta.isFinite else { return nil }
+            self = .volumeScroll(notches: Int(min(50, max(-50, delta)).rounded()))
         case "media-hover": self = .hover
         case "media-hover-end": self = .hoverEnd
         case "start": self = .start
@@ -34,11 +39,28 @@ enum PopupCommand {
         case .hoverEnd: "media-hover-end"
         case .start: "start"
         case .stop: "stop"
+        case .volumeScroll: "volume-scroll"
         }
+    }
+
+    var userInfo: [String: String] {
+        switch self {
+        case .volumeScroll(let notches): ["item": rawValue, "argument": String(notches)]
+        case .toggle, .hover, .hoverEnd, .start, .stop: ["item": rawValue]
+        }
+    }
+
+    init?(userInfo: [AnyHashable: Any]?) {
+        guard let raw = userInfo?["item"] as? String else { return nil }
+        self.init(raw, argument: userInfo?["argument"] as? String)
+    }
+
+    func post() {
+        DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: userInfo, deliverImmediately: true)
     }
 }
 
-enum NetworkKind: String, Codable {
+enum NetworkKind: String {
     case ethernet, wifi, network, none
 }
 
@@ -143,10 +165,24 @@ struct Audio {
         try set(system, address(kAudioHardwarePropertyDefaultOutputDevice), id)
     }
 
-    static func snapshot() -> [String: Any] {
-        let id = current
-        return ["current": id, "volume": volume(id).map { Int(($0 * 100).rounded()) } as Any? ?? NSNull(),
-                "muted": muted(id), "devices": devices().map { ["id": $0.id, "name": $0.name] as [String: Any] }]
+    static func change(by points: Int) throws {
+        guard let value = volume(current) else { return }
+        try setVolume(Float(Int((value * 100).rounded()) + points) / 100)
+    }
+
+    // CoreAudio removes a listener only when given the same block object it was added with.
+    typealias Listener = @convention(block) (UInt32, UnsafePointer<AudioObjectPropertyAddress>) -> Void
+
+    // The listener runs on the main queue.
+    static func listen(_ id: AudioObjectID, _ address: AudioObjectPropertyAddress, _ listener: @escaping Listener) -> Bool {
+        var address = address
+        return AudioObjectAddPropertyListenerBlock(id, &address, .main, listener) == noErr
+    }
+
+    static func unlisten(_ id: AudioObjectID, _ address: AudioObjectPropertyAddress, _ listener: @escaping Listener) {
+        var address = address
+        let status = AudioObjectRemovePropertyListenerBlock(id, &address, .main, listener)
+        if status != noErr { logger.error("Removing an audio listener failed with status \(status, privacy: .public).") }
     }
 }
 
@@ -199,7 +235,7 @@ struct PendingMediaSeek {
     let trackSignature: [String]
 }
 
-struct MediaSnapshot: Codable, Equatable {
+struct MediaSnapshot: Decodable, Equatable {
     let title: String
     let artist: String
     let bundleIdentifier: String
@@ -394,7 +430,7 @@ struct Media {
 
 }
 
-struct NetworkConnection: Codable, Equatable {
+struct NetworkConnection: Equatable {
     let name: String
     let interface: String
     let kind: NetworkKind
@@ -403,9 +439,29 @@ struct NetworkConnection: Codable, Equatable {
     let primary: Bool
 }
 
-struct NetworkState: Codable, Equatable {
+struct NetworkState: Equatable {
     let connections: [NetworkConnection]
     let kind: NetworkKind
+
+    // The patterns cover every key `read` uses, plus service setup for enabling and disabling.
+    static let watchedKeys = ["State:/Network/Global/IPv[46]", "State:/Network/Service/.*/IPv[46]",
+                              "State:/Network/Interface/.*/Link", "Setup:/Network/Service/.*"]
+
+    // Calls `owner.networkChanged()` from a source on the main run loop. The owner invalidates
+    // the source before it goes away, so the unretained pointer never outlives it.
+    static func watch(_ owner: BarFeed) -> (store: SCDynamicStore, source: CFRunLoopSource)? {
+        var context = SCDynamicStoreContext(version: 0, info: Unmanaged.passUnretained(owner).toOpaque(),
+                                            retain: nil, release: nil, copyDescription: nil)
+        guard let store = SCDynamicStoreCreate(nil, "SketchyBar" as CFString, { _, _, info in
+            guard let info else { return }
+            // The run loop source is added only to the main run loop.
+            MainActor.assumeIsolated { Unmanaged<BarFeed>.fromOpaque(info).takeUnretainedValue().networkChanged() }
+        }, &context),
+              SCDynamicStoreSetNotificationKeys(store, nil, watchedKeys as CFArray),
+              let source = SCDynamicStoreCreateRunLoopSource(nil, store, 0) else { return nil }
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        return (store, source)
+    }
 
     static func read() -> NetworkState? {
         guard let preferences = SCPreferencesCreate(nil, "SketchyBar" as CFString, nil),
@@ -465,9 +521,17 @@ enum TailscaleError: LocalizedError {
     }
 }
 
-// Values the bar item renders. Strings appear only at the JSON boundary with status.sh.
-enum TailscaleKind: String, Codable {
+// Values the bar item renders. Strings appear only at the trigger boundary with status.sh.
+enum TailscaleKind: String {
     case running, exitNode = "exit-node", stopped, login, unavailable
+
+    init(_ status: TailscaleStatus) {
+        switch status.backend {
+        case .running: self = status.peers.contains { $0.exitNode } ? .exitNode : .running
+        case .needsLogin, .needsMachineAuth: self = .login
+        case .stopped, .starting, .noState: self = .stopped
+        }
+    }
 }
 
 enum TailscaleBackend: String, Decodable {
@@ -603,11 +667,7 @@ struct Tailscale: Equatable {
         guard let executable = try? executable(),
               let result = try? await ProcessCapture().run(executable, ["status", "--json"]),
               let status = try? decode(TailscaleStatus.self, arguments: ["status", "--json"], result: result) else { return .unavailable }
-        switch status.backend {
-        case .running: return status.peers.contains { $0.exitNode } ? .exitNode : .running
-        case .needsLogin, .needsMachineAuth: return .login
-        case .stopped, .starting, .noState: return .stopped
-        }
+        return TailscaleKind(status)
     }
 
 }
@@ -653,7 +713,7 @@ struct Theme {
         }
         self.numbers = numbers
         var colors: [String: NSColor] = [:]
-        for name in ["TEXT", "TEXT2", "TEXT3", "BAR_COLOR", "BAR_EDGE", "ISLAND_COLOR"] {
+        for name in ["TEXT", "TEXT2", "TEXT3", "BAR_COLOR", "BAR_EDGE", "ISLAND_COLOR", "WARN", "CRIT"] {
             let raw = try required(name)
             guard raw.hasPrefix("0x"), let value = UInt32(raw.dropFirst(2), radix: 16) else { throw ConfigurationError.invalidValue(name) }
             colors[name] = NSColor(srgbRed: CGFloat((value >> 16) & 255) / 255,
@@ -884,7 +944,6 @@ final class Island: NSObject {
     private var height = Spring(0)
     private var link: CADisplayLink?
     private var lastStep: CFTimeInterval?
-    private var stream: Task<Void, Never>?
 
     init(theme: Theme, popups: Popups) {
         self.theme = theme
@@ -923,8 +982,6 @@ final class Island: NSObject {
         guard next != notch else { return false }
         notch = next
         guard let next else {
-            stream?.cancel()
-            stream = nil
             media = nil
             stopLink()
             shape = .hidden
@@ -945,13 +1002,10 @@ final class Island: NSObject {
         width = Spring(size.width)
         height = Spring(size.height)
         render()
-        startStream()
         return true
     }
 
     func stop() {
-        stream?.cancel()
-        stream = nil
         stopLink()
     }
 
@@ -978,7 +1032,7 @@ final class Island: NSObject {
         move(to: media == nil ? .hidden : .compact)
     }
 
-    private func apply(_ snapshot: MediaSnapshot?) {
+    func apply(_ snapshot: MediaSnapshot?) {
         let next = snapshot?.title.isEmpty == false ? snapshot : nil
         if next?.artworkData != media?.artworkData || artwork.layer?.contents == nil {
             let image = next?.artworkData.flatMap(NSImage.init(data:))
@@ -1008,30 +1062,6 @@ final class Island: NSObject {
         guard let color = pixel.colorAt(x: 0, y: 0)?.usingColorSpace(.deviceRGB), color.saturationComponent > 0.15 else { return nil }
         return NSColor(hue: color.hueComponent, saturation: min(1, color.saturationComponent * 1.2),
                        brightness: max(0.8, color.brightnessComponent), alpha: 1)
-    }
-
-    private func startStream() {
-        guard stream == nil else { return }
-        stream = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    let executable = try Media.executable()
-                    _ = try await ProcessCapture().run(executable, ["stream", "--no-diff", "--debounce=100"]) { line in
-                        guard let event = try? JSONDecoder().decode(MediaStreamEvent.self, from: line) else { return }
-                        self?.apply(event.payload)
-                    }
-                } catch is CancellationError {
-                    return
-                } catch MediaError.missingCLI {
-                    logger.error("Island media stream needs media-control on PATH.")
-                    return
-                } catch {
-                    logger.error("Island media stream failed: \(error.localizedDescription, privacy: .private)")
-                }
-                // The stream ends when media-control or its system service restarts.
-                try? await Task.sleep(for: .seconds(5))
-            }
-        }
     }
 
     private func size(_ shape: Shape) -> NSSize {
@@ -1142,6 +1172,487 @@ struct CalendarEvent {
     let color: NSColor
 }
 
+// How strained a reading is. The bar and the system popup tint the same way.
+enum Strain: String {
+    case normal, warn, crit
+}
+
+enum MemoryPressure: Int32 {
+    case normal = 1, warning = 2, critical = 4
+
+    var title: String {
+        switch self {
+        case .normal: "Normal"
+        case .warning: "Warning"
+        case .critical: "Critical"
+        }
+    }
+
+    var strain: Strain {
+        switch self {
+        case .normal: .normal
+        case .warning: .warn
+        case .critical: .crit
+        }
+    }
+}
+
+// Cumulative CPU ticks since boot. The kernel counters are 32-bit and wrap, so differences wrap too.
+struct CPUTicks {
+    let user: UInt32
+    let system: UInt32
+    let idle: UInt32
+
+    // Like Activity Monitor and SketchyBar's cpu_load, nice time is left out.
+    func load(since earlier: CPUTicks) -> CPULoad {
+        let user = Double(user &- earlier.user), system = Double(system &- earlier.system)
+        let total = user + system + Double(idle &- earlier.idle)
+        return total > 0 ? CPULoad(user: user / total, system: system / total) : CPULoad(user: 0, system: 0)
+    }
+}
+
+// Fractions of the interval, from 0 to 1.
+struct CPULoad: Equatable {
+    let user: Double
+    let system: Double
+    var total: Double { user + system }
+}
+
+// Activity Monitor's Memory Used is App + Wired + Compressed.
+struct MemoryUsage: Equatable {
+    let app: UInt64
+    let wired: UInt64
+    let compressed: UInt64
+    let total: UInt64
+    var used: UInt64 { app + wired + compressed }
+}
+
+struct Capacity: Equatable {
+    let used: UInt64
+    let total: UInt64
+}
+
+struct InterfaceBytes {
+    let received: UInt32
+    let sent: UInt32
+}
+
+struct NetworkRate: Equatable {
+    let interface: String
+    let received: Double
+    let sent: Double
+}
+
+struct CoreCluster: Equatable {
+    let title: String
+    let load: Double
+}
+
+struct ProcessLoad {
+    let name: String
+    let percent: Int
+}
+
+// Unprivileged public reads. Unsafe Mach, sysctl, getifaddrs, IOKit, and libproc access stays here.
+struct SystemRead {
+    static let host = mach_host_self()
+
+    static func number<T: BitwiseCopyable>(_ name: String, _ initial: T) -> T? {
+        var value = initial
+        var size = MemoryLayout<T>.size
+        return sysctlbyname(name, &value, &size, nil, 0) == 0 && size == MemoryLayout<T>.size ? value : nil
+    }
+
+    static func text(_ name: String) -> String? {
+        var size = 0
+        guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return nil }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname(name, &buffer, &size, nil, 0) == 0 else { return nil }
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    static func cpu() -> CPUTicks? {
+        var info = host_cpu_load_info()
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info>.size / MemoryLayout<integer_t>.size)
+        let status = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { host_statistics(host, HOST_CPU_LOAD_INFO, $0, &count) }
+        }
+        guard status == KERN_SUCCESS else { return nil }
+        return CPUTicks(user: info.cpu_ticks.0, system: info.cpu_ticks.1, idle: info.cpu_ticks.2)
+    }
+
+    static func cores() -> [CPUTicks] {
+        var cpus: natural_t = 0
+        var info: processor_info_array_t?
+        var count: mach_msg_type_number_t = 0
+        guard host_processor_info(host, PROCESSOR_CPU_LOAD_INFO, &cpus, &info, &count) == KERN_SUCCESS, let info else { return [] }
+        defer { vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: info)), vm_size_t(count) * vm_size_t(MemoryLayout<integer_t>.stride)) }
+        let values = UnsafeBufferPointer(start: info, count: Int(count))
+        let stride = Int(CPU_STATE_MAX)
+        guard values.count >= Int(cpus) * stride else { return [] }
+        return (0..<Int(cpus)).map { cpu in
+            let base = cpu * stride
+            return CPUTicks(user: UInt32(bitPattern: values[base + Int(CPU_STATE_USER)]),
+                            system: UInt32(bitPattern: values[base + Int(CPU_STATE_SYSTEM)]),
+                            idle: UInt32(bitPattern: values[base + Int(CPU_STATE_IDLE)]))
+        }
+    }
+
+    // Apple silicon numbers its logical CPUs by cluster with efficiency cores first, which the
+    // device tree's cluster-type confirms. Titles and counts come from hw.perflevel*.
+    static let clusters: [(title: String, cpus: Range<Int>)] = {
+        let levels = number("hw.nperflevels", Int32(0)) ?? 0
+        guard levels > 1 else {
+            let count = Int(number("hw.logicalcpu", Int32(0)) ?? 0)
+            return [("Cores (\(count))", 0..<count)]
+        }
+        var start = 0
+        return (0..<levels).reversed().map { level in
+            let count = Int(number("hw.perflevel\(level).logicalcpu", Int32(0)) ?? 0)
+            let name = text("hw.perflevel\(level).name") ?? "Level \(level)"
+            defer { start += count }
+            return ("\(name) cores (\(count))", start..<start + count)
+        }.reversed()
+    }()
+
+    static let pageSize: UInt64 = {
+        var size: vm_size_t = 0
+        return host_page_size(host, &size) == KERN_SUCCESS ? UInt64(size) : 16384
+    }()
+
+    static func memory() -> MemoryUsage? {
+        var info = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
+        let status = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { host_statistics64(host, HOST_VM_INFO64, $0, &count) }
+        }
+        guard status == KERN_SUCCESS else { return nil }
+        let app = UInt64(info.internal_page_count) - min(UInt64(info.internal_page_count), UInt64(info.purgeable_count))
+        return MemoryUsage(app: app * pageSize, wired: UInt64(info.wire_count) * pageSize,
+                           compressed: UInt64(info.compressor_page_count) * pageSize, total: ProcessInfo.processInfo.physicalMemory)
+    }
+
+    static func pressure() -> MemoryPressure {
+        number("kern.memorystatus_vm_pressure_level", Int32(0)).flatMap(MemoryPressure.init) ?? .normal
+    }
+
+    static func swap() -> Capacity? {
+        number("vm.swapusage", xsw_usage()).map { Capacity(used: $0.xsu_used, total: $0.xsu_total) }
+    }
+
+    static func disk() -> Capacity? {
+        var stats = statfs()
+        guard statfs("/", &stats) == 0 else { return nil }
+        let block = UInt64(stats.f_bsize)
+        return Capacity(used: (stats.f_blocks - stats.f_bavail) * block, total: stats.f_blocks * block)
+    }
+
+    static func bytes(_ interface: String) -> InterfaceBytes? {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return nil }
+        defer { freeifaddrs(list) }
+        for entry in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            guard let address = entry.pointee.ifa_addr, address.pointee.sa_family == UInt8(AF_LINK),
+                  let data = entry.pointee.ifa_data, String(cString: entry.pointee.ifa_name) == interface else { continue }
+            let counters = data.load(as: if_data.self)
+            return InterfaceBytes(received: counters.ifi_ibytes, sent: counters.ifi_obytes)
+        }
+        return nil
+    }
+
+    static func bootTime() -> Date? {
+        number("kern.boottime", timeval()).map { Date(timeIntervalSince1970: Double($0.tv_sec) + Double($0.tv_usec) / 1_000_000) }
+    }
+
+    // The highest utilization any GPU reports.
+    static func gpu() -> Int? {
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(iterator) }
+        var result: Int?
+        while case let service = IOIteratorNext(iterator), service != 0 {
+            defer { IOObjectRelease(service) }
+            guard let property = IORegistryEntryCreateCFProperty(service, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0),
+                  let statistics = property.takeRetainedValue() as? [String: Any],
+                  let value = statistics["Device Utilization %"] as? Int else { continue }
+            result = max(result ?? 0, value)
+        }
+        return result
+    }
+
+    // rusage times are in Mach time units, which are not nanoseconds on Apple silicon.
+    static let nanosecondsPerTick: Double = {
+        var timebase = mach_timebase_info_data_t()
+        return mach_timebase_info(&timebase) == KERN_SUCCESS && timebase.denom > 0 ? Double(timebase.numer) / Double(timebase.denom) : 1
+    }()
+
+    // CPU time in nanoseconds for each process the user owns. Other users' processes are not readable.
+    static func processTimes() -> [pid_t: Double] {
+        let capacity = Int(proc_listallpids(nil, 0)) + 64
+        guard capacity > 64 else { return [:] }
+        var pids = [pid_t](repeating: 0, count: capacity)
+        let count = Int(proc_listallpids(&pids, Int32(capacity * MemoryLayout<pid_t>.size)))
+        guard count > 0 else { return [:] }
+        let user = getuid()
+        var times: [pid_t: Double] = [:]
+        for pid in pids.prefix(min(count, capacity)) where pid > 0 {
+            var info = proc_bsdshortinfo()
+            let size = Int32(MemoryLayout<proc_bsdshortinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDT_SHORTBSDINFO, 0, &info, size) == size, info.pbsi_uid == user else { continue }
+            var usage = rusage_info_v2()
+            let status = withUnsafeMutablePointer(to: &usage) {
+                $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V2, $0) }
+            }
+            guard status == 0 else { continue }
+            times[pid] = Double(usage.ri_user_time + usage.ri_system_time) * nanosecondsPerTick
+        }
+        return times
+    }
+
+    static func processName(_ pid: pid_t) -> String {
+        if let name = NSRunningApplication(processIdentifier: pid)?.localizedName { return name }
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXCOMLEN) + 1)
+        guard proc_name(pid, &buffer, UInt32(buffer.count)) > 0 else { return "Process \(pid)" }
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    static func now() -> UInt64 { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
+}
+
+// One reading every 2 s. The bar shows CPU and memory from it, and the open popup shows all of it.
+struct SystemSample: Equatable {
+    let time: UInt64
+    let cpu: CPULoad
+    let clusters: [CoreCluster]
+    let memory: MemoryUsage
+    let pressure: MemoryPressure
+    let swap: Capacity?
+    let disk: Capacity?
+    let network: NetworkRate?
+    let thermal: ProcessInfo.ThermalState
+    // CPU above 80 % for 5 samples in a row, which is 10 s.
+    let busy: Bool
+
+    var cpuStrain: Strain { thermal == .serious || thermal == .critical ? .crit : busy ? .warn : .normal }
+    var diskStrain: Strain { disk.map { $0.total > 0 && ($0.total - $0.used) * 10 < $0.total } == true ? .warn : .normal }
+
+    var bar: BarState {
+        .system(cpu: Int((cpu.total * 100).rounded()),
+                memory: memory.total > 0 ? Int((Double(memory.used) * 100 / Double(memory.total)).rounded()) : 0,
+                cpuStrain: cpuStrain, memoryStrain: pressure.strain, diskStrain: diskStrain)
+    }
+}
+
+// Keeps the previous counters, because CPU load and network speed are differences over time.
+struct SystemSampler {
+    private var time: UInt64 = 0
+    private var cpu: CPUTicks?
+    private var cores: [CPUTicks] = []
+    private var network: (interface: String, bytes: InterfaceBytes)?
+    private var busySamples = 0
+
+    // The first call only primes the counters.
+    mutating func sample(interface: String?) -> SystemSample? {
+        let now = SystemRead.now()
+        let ticks = SystemRead.cpu(), cores = SystemRead.cores()
+        let bytes = interface.flatMap(SystemRead.bytes)
+        defer {
+            time = now
+            cpu = ticks
+            self.cores = cores
+            if let interface, let bytes { network = (interface, bytes) } else { network = nil }
+        }
+        guard let ticks, let previous = cpu, now > time, let memory = SystemRead.memory() else { return nil }
+        let load = ticks.load(since: previous)
+        busySamples = load.total > 0.8 ? busySamples + 1 : 0
+        let clusters = cores.count == self.cores.count ? SystemRead.clusters.compactMap { cluster -> CoreCluster? in
+            let range = cluster.cpus.clamped(to: 0..<cores.count)
+            guard !range.isEmpty else { return nil }
+            let total = range.reduce(0) { $0 + cores[$1].load(since: self.cores[$1]).total }
+            return CoreCluster(title: cluster.title, load: total / Double(range.count))
+        } : []
+        var rate: NetworkRate?
+        if let interface, let bytes, let network, network.interface == interface {
+            let seconds = Double(now - time) / 1_000_000_000
+            rate = NetworkRate(interface: interface, received: Double(bytes.received &- network.bytes.received) / seconds,
+                               sent: Double(bytes.sent &- network.bytes.sent) / seconds)
+        }
+        return SystemSample(time: now, cpu: load, clusters: clusters, memory: memory, pressure: SystemRead.pressure(),
+                            swap: SystemRead.swap(), disk: SystemRead.disk(), network: rate,
+                            thermal: ProcessInfo.processInfo.thermalState, busy: busySamples >= 5)
+    }
+}
+
+// Top processes by CPU since the previous call. Read only while the system popup is open.
+struct ProcessSampler {
+    private var time: UInt64 = 0
+    private var times: [pid_t: Double] = [:]
+
+    mutating func sample(count: Int) -> [ProcessLoad]? {
+        let now = SystemRead.now()
+        let current = SystemRead.processTimes()
+        defer { time = now; times = current }
+        guard time > 0, now > time else { return nil }
+        let elapsed = Double(now - time)
+        return current.compactMap { pid, cpu in times[pid].flatMap { cpu >= $0 ? (pid, (cpu - $0) / elapsed) : nil } }
+            .sorted { $0.1 > $1.1 }
+            .prefix(count)
+            .map { ProcessLoad(name: SystemRead.processName($0.0), percent: Int(($0.1 * 100).rounded())) }
+    }
+}
+
+// What a bar item shows. Strings exist only in `variables`, at the sketchybar trigger boundary.
+enum BarState: Equatable {
+    case volume(percent: Int?, muted: Bool)
+    case network(NetworkKind)
+    case media(title: String, artist: String, playing: Bool)
+    case mediaUnavailable
+    case tailscale(TailscaleKind)
+    case system(cpu: Int, memory: Int, cpuStrain: Strain, memoryStrain: Strain, diskStrain: Strain)
+
+    // Each item subscribes to its own event in sketchybarrc, and status.sh reads the variables.
+    var event: String {
+        switch self {
+        case .volume: "volume_state"
+        case .network: "network_state"
+        case .media, .mediaUnavailable: "media_state"
+        case .tailscale: "tailscale_state"
+        case .system: "system_state"
+        }
+    }
+
+    var variables: [String] {
+        switch self {
+        case .volume(let percent, let muted): ["VOLUME=\(percent.map(String.init) ?? "fixed")", "MUTED=\(muted)"]
+        case .network(let kind): ["KIND=\(kind.rawValue)"]
+        case .media(let title, let artist, let playing): ["MEDIA=\(playing ? "playing" : "paused")", "TITLE=\(title)", "ARTIST=\(artist)"]
+        case .mediaUnavailable: ["MEDIA=unavailable"]
+        case .tailscale(let kind): ["KIND=\(kind.rawValue)"]
+        case .system(let cpu, let memory, let cpuStrain, let memoryStrain, let diskStrain):
+            ["CPU=\(cpu)", "MEM=\(memory)", "CPU_LEVEL=\(cpuStrain.rawValue)", "MEM_LEVEL=\(memoryStrain.rawValue)",
+             "DISK_LEVEL=\(diskStrain.rawValue)"]
+        }
+    }
+}
+
+// Watches volume, the output device, network, Tailscale, and system resources, and sends each change to the bar.
+// Popups feeds it media from the stream it shares with the island.
+final class BarFeed {
+    private let sketchybar: URL
+    private var pushed: [String: BarState] = [:]
+    private var pending: [String: BarState] = [:]
+    private var pushing: Task<Void, Never>?
+    private var audioListener: Audio.Listener?
+    private var audioDevice: AudioObjectID?
+    private var audioWatches: [(id: AudioObjectID, address: AudioObjectPropertyAddress)] = []
+    private var network: (store: SCDynamicStore, source: CFRunLoopSource)?
+    private var tailscale: Task<Void, Never>?
+    private var systemLoop: Task<Void, Never>?
+    private var sampler = SystemSampler()
+    private var primaryInterface: String?
+    private(set) var system: SystemSample?
+
+    init(sketchybar: URL) { self.sketchybar = sketchybar }
+
+    func start() {
+        // Audio.listen delivers on the main queue, which the main actor runs on.
+        let listener: Audio.Listener = { _, _ in MainActor.assumeIsolated { self.audioChanged() } }
+        audioListener = listener
+        let device = Audio.address(kAudioHardwarePropertyDefaultOutputDevice)
+        if Audio.listen(Audio.system, device, listener) { audioWatches.append((Audio.system, device)) }
+        network = NetworkState.watch(self)
+        audioChanged()
+        networkChanged()
+        pollTailscale()
+        sampleSystem()
+        systemLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, let self else { return }
+                self.sampleSystem()
+            }
+        }
+    }
+
+    // A restarted bar or a wake gets every value again, then fresh reads.
+    func pushAll() {
+        for state in pushed.values { publish(state, force: true) }
+        audioChanged()
+        networkChanged()
+        pollTailscale()
+    }
+
+    func stop() {
+        tailscale?.cancel()
+        tailscale = nil
+        systemLoop?.cancel()
+        systemLoop = nil
+        pushing?.cancel()
+        pushing = nil
+        pending.removeAll()
+        if let audioListener { for watch in audioWatches { Audio.unlisten(watch.id, watch.address, audioListener) } }
+        audioWatches.removeAll()
+        audioListener = nil
+        if let network { CFRunLoopSourceInvalidate(network.source) }
+        network = nil
+    }
+
+    // Triggers run one at a time, so the bar sees changes in order. A burst sends only the latest.
+    func publish(_ state: BarState, force: Bool = false) {
+        guard force || pushed[state.event] != state else { return }
+        pushed[state.event] = state
+        pending[state.event] = state
+        guard pushing == nil else { return }
+        pushing = Task { [weak self] in
+            while !Task.isCancelled, let self, let (event, state) = self.pending.first {
+                self.pending[event] = nil
+                _ = try? await ProcessCapture().run(self.sketchybar, ["--trigger", event] + state.variables)
+            }
+            self?.pushing = nil
+        }
+    }
+
+    func networkChanged() {
+        guard let state = NetworkState.read() else { return }
+        primaryInterface = (state.connections.first { $0.primary } ?? state.connections.first { $0.active })?.interface
+        publish(.network(state.kind))
+    }
+
+    // Pushes only when a rounded number or a strain level changes, because publish skips equal states.
+    func sampleSystem() {
+        guard let sample = sampler.sample(interface: primaryInterface) else { return }
+        system = sample
+        publish(sample.bar)
+    }
+
+    func pollTailscale() {
+        tailscale?.cancel()
+        tailscale = Task { [weak self] in
+            while !Task.isCancelled {
+                let kind = await Tailscale.kind()
+                guard !Task.isCancelled, let self else { return }
+                self.publish(.tailscale(kind))
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    private func audioChanged() {
+        let id = Audio.current
+        if id != audioDevice { watch(id) }
+        publish(.volume(percent: Audio.volume(id).map { Int(($0 * 100).rounded()) }, muted: Audio.muted(id)))
+    }
+
+    private func watch(_ device: AudioObjectID) {
+        guard let audioListener else { return }
+        for watch in audioWatches where watch.id != Audio.system { Audio.unlisten(watch.id, watch.address, audioListener) }
+        audioWatches.removeAll { $0.id != Audio.system }
+        audioDevice = device
+        let controls = Audio.controls(device, kAudioDevicePropertyVolumeScalar) + Audio.controls(device, kAudioDevicePropertyMute)
+        for address in controls where Audio.listen(device, address, audioListener) { audioWatches.append((device, address)) }
+    }
+}
+
 final class Popups: NSObject, NSApplicationDelegate {
     static let notification = Notification.Name("com.bjoernaagaard.sketchybar.popup")
     let theme: Theme
@@ -1187,9 +1698,18 @@ final class Popups: NSObject, NSApplicationDelegate {
     // One CLI write at a time. Its process is owned here and ended at shutdown.
     var tailscaleCommand: Task<Void, Never>?
     var tailscaleLogin = false
+    let bar: BarFeed
+    // One media-control stream feeds the bar item and, on a notched display, the island.
+    var mediaStream: Task<Void, Never>?
+    var streamedMedia: MediaSnapshot?
+    // The system popup shows the bar's latest sample and adds GPU and top processes while open.
+    var systemShown: SystemSample?
+    var processes = ProcessSampler()
+    var topProcesses: [ProcessLoad] = []
 
     init(theme: Theme) {
         self.theme = theme
+        bar = BarFeed(sketchybar: URL(fileURLWithPath: theme.sketchybarPath))
         super.init()
     }
 
@@ -1225,6 +1745,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             return event
         }) { monitors.append(monitor) }
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.willSleepNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(woke), name: NSWorkspace.didWakeNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(calendarChanged), name: .EKEventStoreChanged, object: nil)
@@ -1244,6 +1765,7 @@ final class Popups: NSObject, NSApplicationDelegate {
                     if self.hoverCanClose && !self.anchor.contains(pointer) && !self.popupWindow.frame.contains(pointer) { self.close() }
                 case .clock:
                     if self.calendarMinute != Int(Date().timeIntervalSince1970 / 60) || self.calendarDirty { self.loadCalendar() }
+                case .system: if self.bar.system != self.systemShown { self.refreshSystem() }
                 case nil: break
                 }
             }
@@ -1251,16 +1773,61 @@ final class Popups: NSObject, NSApplicationDelegate {
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
         island.updateNotch()
+        bar.start()
+        startMediaStream()
         switch initialCommand {
         case .toggle(let popup): toggle(popup)
         case .hover: show(.media)
+        case .volumeScroll(let notches): scrollVolume(notches)
         case .start, .hoverEnd, .stop: break
         }
+    }
+
+    // Each notch moves the volume 2 percentage points. Notifications arrive one at a time on the main
+    // actor, so each notch starts from the volume the previous one wrote.
+    func scrollVolume(_ notches: Int) {
+        do { try Audio.change(by: 2 * notches) }
+        catch { logger.error("Changing the volume failed: \(error.localizedDescription, privacy: .public)") }
+    }
+
+    @objc func woke() { bar.pushAll() }
+
+    func startMediaStream() {
+        guard mediaStream == nil else { return }
+        mediaStream = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    let executable = try Media.executable()
+                    _ = try await ProcessCapture().run(executable, ["stream", "--no-diff", "--debounce=100"]) { line in
+                        guard let event = try? JSONDecoder().decode(MediaStreamEvent.self, from: line) else { return }
+                        self?.streamed(event.payload)
+                    }
+                } catch is CancellationError {
+                    return
+                } catch MediaError.missingCLI {
+                    logger.error("The media stream needs media-control on PATH.")
+                    self?.bar.publish(.mediaUnavailable)
+                    return
+                } catch {
+                    logger.error("The media stream failed: \(error.localizedDescription, privacy: .private)")
+                    self?.bar.publish(.mediaUnavailable)
+                }
+                // The stream ends when media-control or its system service restarts.
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    func streamed(_ snapshot: MediaSnapshot?) {
+        streamedMedia = snapshot
+        bar.publish(.media(title: snapshot?.title ?? "", artist: snapshot?.artist ?? "", playing: snapshot?.playing ?? false))
+        if island.notch != nil { island.apply(snapshot) }
     }
 
     @objc func screensChanged() {
         close()
         guard island.updateNotch() else { return }
+        if island.notch != nil { island.apply(streamedMedia) }
         // notch.sh moves the bar between its floating and notched layouts.
         notchTask?.cancel()
         notchTask = Task { [weak self] in await self?.trigger("notch_change") }
@@ -1276,6 +1843,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         tailscaleCommand = nil
         notchTask?.cancel()
         notchTask = nil
+        mediaStream?.cancel()
+        mediaStream = nil
+        bar.stop()
         island.stop()
         ProcessCapture.terminateRunningChildren()
         timer?.invalidate()
@@ -1287,12 +1857,13 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     @objc func receive(_ notification: Notification) {
-        guard let raw = notification.userInfo?["item"] as? String, let command = PopupCommand(raw) else { return }
+        guard let command = PopupCommand(userInfo: notification.userInfo) else { return }
         switch command {
         case .stop: NSApp.terminate(nil)
+        case .volumeScroll(let notches): scrollVolume(notches)
         case .hover: show(.media)
         case .hoverEnd: if item == .media { hoverCanClose = true }
-        case .start: break
+        case .start: bar.pushAll()
         case .toggle(let popup): toggle(popup)
         }
     }
@@ -1362,6 +1933,11 @@ final class Popups: NSObject, NSApplicationDelegate {
                 self.events = []
                 self.calendarError = nil
                 self.buildCalendar()
+            case .system:
+                if self.bar.system == nil { self.bar.sampleSystem() }
+                self.processes = ProcessSampler()
+                self.topProcesses = self.processes.sample(count: 3) ?? []
+                self.buildSystem()
             }
             guard !Task.isCancelled else { return }
             self.openingTask = nil
@@ -1651,7 +2227,6 @@ final class Popups: NSObject, NSApplicationDelegate {
                 let current = try await Media.read()
                 guard !Task.isCancelled, current?.trackSignature == signature else { return }
                 try await Media.seek(to: seconds)
-                await self.trigger("media_change")
             } catch {
                 guard !Task.isCancelled, self.item == .media, self.isOpen else { return }
                 self.pendingMediaSeek = nil
@@ -1678,7 +2253,6 @@ final class Popups: NSObject, NSApplicationDelegate {
             guard !Task.isCancelled else { return }
             do {
                 try await Media.perform(action)
-                await self.trigger("media_change")
             } catch {
                 guard !Task.isCancelled, self.item == .media, self.isOpen else { return }
                 NSAlert(error: error).beginSheetModal(for: self.popupWindow, completionHandler: nil)
@@ -1733,6 +2307,169 @@ final class Popups: NSObject, NSApplicationDelegate {
         view.addSubview(network)
     }
 
+    func refreshSystem() {
+        // A rebuild under a pressed button would drop its click. The next sample catches up.
+        guard NSEvent.pressedMouseButtons == 0 else { return }
+        if let top = processes.sample(count: 3) { topProcesses = top }
+        buildSystem()
+    }
+
+    func buildSystem() {
+        systemShown = bar.system
+        let sample = bar.system
+        let pad = theme.number("POPUP_PADDING")
+        let width = theme.number("POPUP_WIDTH")
+        let row = theme.number("POPUP_ROW")
+        let clusters = sample?.clusters ?? []
+        // Three process rows always, so the panel keeps its height between refreshes.
+        let rows = CGFloat(15 + clusters.count + 3)
+        let meterHeight: CGFloat = 8, legendHeight: CGFloat = 24
+        let view = surface(height: pad * 2 + row * rows + meterHeight * 2 + legendHeight)
+        var y = pad
+        func next() -> CGFloat { defer { y += row }; return y }
+        let valueFont = NSFont.monospacedDigitSystemFont(ofSize: theme.font.pointSize, weight: .semibold)
+        func line(_ title: String, _ value: String, valueColor: String = "TEXT2") {
+            let rowY = next()
+            let detail = label(value, x: 0, y: rowY, width: width, color: valueColor, in: view)
+            detail.font = valueFont
+            detail.sizeToFit()
+            detail.setFrameOrigin(NSPoint(x: width - pad - detail.frame.width, y: rowY))
+            label(title, x: pad, y: rowY, width: detail.frame.minX - pad - theme.number("POPUP_GAP"), in: view)
+        }
+        func heading(_ text: String) { label(text, x: pad, y: next(), width: width - pad * 2, color: "TEXT3", in: view) }
+        // Thin bars under the row above, in TEXT at falling opacity, or tinted under strain.
+        func meter(_ parts: [(fraction: Double, alpha: CGFloat)], strain: Strain) {
+            let track = NSView(frame: NSRect(x: pad, y: y - row + 26, width: width - pad * 2, height: 6))
+            track.wantsLayer = true
+            track.layer?.backgroundColor = theme.color("BAR_EDGE").cgColor
+            track.layer?.cornerRadius = 3
+            track.layer?.masksToBounds = true
+            let color = switch strain {
+            case .normal: theme.color("TEXT")
+            case .warn: theme.color("WARN")
+            case .crit: theme.color("CRIT")
+            }
+            var x: CGFloat = 0
+            for part in parts {
+                let segment = CALayer()
+                let length = (track.frame.width * CGFloat(min(1, max(0, part.fraction)))).rounded()
+                segment.frame = CGRect(x: x, y: 0, width: min(length, track.frame.width - x), height: 6)
+                segment.backgroundColor = color.withAlphaComponent(part.alpha).cgColor
+                track.layer?.addSublayer(segment)
+                x += segment.frame.width
+            }
+            view.addSubview(track)
+            y += meterHeight
+        }
+        func percent(_ fraction: Double) -> String { "\(Int((fraction * 100).rounded()))%" }
+        func gigabytes(_ bytes: UInt64, unit: Double) -> String {
+            let value = Double(bytes) / unit
+            return value.rounded() == value || value >= 100 ? "\(Int(value.rounded()))" : String(format: "%.1f", value)
+        }
+        let gib = Double(1 << 30)
+        func speed(_ bytes: Double) -> String {
+            bytes < 1_000_000 ? "\(Int((bytes / 1000).rounded())) KB/s" : String(format: "%.1f MB/s", bytes / 1_000_000)
+        }
+
+        let titleY = next()
+        label("System", x: pad, y: titleY, width: width - pad * 2, in: view)
+        if let boot = SystemRead.bootTime() {
+            let minutes = max(0, Int(Date().timeIntervalSince(boot) / 60))
+            let text = minutes >= 1440 ? "Up \(minutes / 1440) d \(minutes % 1440 / 60) h"
+                : minutes >= 60 ? "Up \(minutes / 60) h \(minutes % 60) min" : "Up \(minutes) min"
+            let uptime = label(text, x: pad, y: titleY, width: width - pad * 2, color: "TEXT3", in: view)
+            uptime.alignment = .right
+        }
+
+        heading("CPU")
+        line("Load", sample.map { percent($0.cpu.total) } ?? "")
+        if let sample { meter([(sample.cpu.user, 0.92), (sample.cpu.system, 0.45)], strain: sample.cpuStrain) }
+        for cluster in clusters { line(cluster.title, percent(cluster.load)) }
+
+        heading("Memory")
+        let memory = sample?.memory
+        line("Used", memory.map { "\(gigabytes($0.used, unit: gib)) of \(gigabytes($0.total, unit: gib)) GB" } ?? "")
+        if let sample, sample.memory.total > 0 {
+            let total = Double(sample.memory.total)
+            meter([(Double(sample.memory.app) / total, 0.92), (Double(sample.memory.wired) / total, 0.6),
+                 (Double(sample.memory.compressed) / total, 0.35)], strain: sample.pressure.strain)
+            let entries = [("App", sample.memory.app, 0.92), ("Wired", sample.memory.wired, 0.6),
+                           ("Compressed", sample.memory.compressed, 0.35)] as [(String, UInt64, CGFloat)]
+            let texts = entries.map { name, bytes, _ in
+                label("\(name) \(String(format: "%.1f", Double(bytes) / gib))", x: 0, y: y, width: width, color: "TEXT2", in: view)
+            }
+            // Each entry is an 8 pt swatch, 4 pt, then its text. Wide values close the 10 pt gaps down to
+            // 6 pt, then shrink the text, so the legend never passes the right padding.
+            let swatches = CGFloat(entries.count) * 12, gaps = CGFloat(entries.count - 1)
+            var font = NSFont(name: "SF Pro Semibold", size: 11) ?? .systemFont(ofSize: 11, weight: .semibold)
+            func measure() -> CGFloat {
+                for text in texts { text.font = font; text.sizeToFit() }
+                return texts.reduce(0) { $0 + $1.frame.width }
+            }
+            var textWidth = measure()
+            let gap = min(10, max(6, (width - pad * 2 - swatches - textWidth) / gaps))
+            while textWidth > width - pad * 2 - swatches - gap * gaps && font.pointSize > 6 {
+                font = font.withSize(font.pointSize - 0.5)
+                textWidth = measure()
+            }
+            var x = pad
+            for (entry, text) in zip(entries, texts) {
+                let swatch = NSView(frame: NSRect(x: x, y: y + 3, width: 8, height: 8))
+                swatch.wantsLayer = true
+                swatch.layer?.cornerRadius = 2
+                swatch.layer?.backgroundColor = theme.color("TEXT").withAlphaComponent(entry.2).cgColor
+                view.addSubview(swatch)
+                text.setFrameOrigin(NSPoint(x: x + 12, y: y + 7 - text.frame.height / 2))
+                x = text.frame.maxX + gap
+            }
+            y += legendHeight
+        }
+        line("Pressure", sample?.pressure.title ?? "")
+        line("Swap", sample?.swap.map { "\(gigabytes($0.used, unit: gib)) of \(gigabytes($0.total, unit: gib)) GB" } ?? "")
+
+        heading("Storage and network")
+        let volume = (try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeNameKey]))?.volumeName ?? "Startup disk"
+        line(volume, sample?.disk.map { "\(gigabytes($0.total - $0.used, unit: 1e9)) GB free" } ?? "")
+        // U+2193 and U+2191 were checked against /Library/Fonts/SF-Pro.ttf (glyphs 31651 and 31629).
+        if let network = sample?.network {
+            line(network.interface, "↓ \(speed(network.received))  ↑ \(speed(network.sent))")
+        } else {
+            line("Network", "Not connected", valueColor: "TEXT3")
+        }
+
+        heading("Graphics and heat")
+        line("GPU", SystemRead.gpu().map { "\($0)%" } ?? "Unavailable")
+        let thermal = switch sample?.thermal {
+        case .nominal: "Nominal"
+        case .fair: "Fair"
+        case .serious: "Serious"
+        case .critical: "Critical"
+        case nil: ""
+        @unknown default: "Unknown"
+        }
+        line("Thermal state", thermal)
+
+        heading("Top processes")
+        for index in 0..<3 {
+            if index < topProcesses.count { line(topProcesses[index].name, "\(topProcesses[index].percent)%") } else { y += row }
+        }
+
+        let monitor = NSButton(title: "Activity Monitor…", target: self, action: #selector(openActivityMonitor))
+        monitor.frame = NSRect(x: pad, y: next(), width: width - pad * 2, height: row)
+        monitor.bezelStyle = .inline
+        monitor.font = theme.font
+        view.addSubview(monitor)
+    }
+
+    @objc func openActivityMonitor() {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.ActivityMonitor") else {
+            logger.error("Activity Monitor is not installed.")
+            return
+        }
+        NSWorkspace.shared.open(url)
+        close()
+    }
+
     func openSettings(_ address: String) {
         // Callers pass fixed URL literals. A parse failure is a programmer mistake.
         guard let url = URL(string: address) else { preconditionFailure("Invalid settings URL: \(address)") }
@@ -1750,6 +2487,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             let state = try await Tailscale.read()
             guard !Task.isCancelled else { return }
             tailscale = .success(state)
+            bar.publish(.tailscale(TailscaleKind(state.status)))
         } catch {
             guard !Task.isCancelled else { return }
             tailscale = .failure(error as? TailscaleError ?? .commandFailed(error.localizedDescription))
@@ -1930,8 +2668,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             do {
                 let result = try await ProcessCapture().run(Tailscale.executable(), arguments)
                 guard !Task.isCancelled else { return }
-                await self.trigger("tailscale_change")
-                guard !Task.isCancelled else { return }
+                self.bar.pollTailscale()
                 self.tailscaleCommand = nil
                 guard self.item == .tailscale, self.isOpen else { return }
                 if result.status != 0 && result.status != SIGTERM {
@@ -2178,39 +2915,31 @@ func runCLI(_ operation: @escaping () async throws -> Void) -> Never {
 }
 
 let arguments = CommandLine.arguments
-if arguments.count > 1 && arguments[1] == "audio" {
-    let data = try JSONSerialization.data(withJSONObject: Audio.snapshot(), options: [.sortedKeys])
-    print(String(decoding: data, as: UTF8.self))
-} else if arguments.count > 1 && arguments[1] == "network-state" {
-    guard let state = NetworkState.read() else { exit(1) }
-    let data = try JSONEncoder().encode(state)
-    print(String(decoding: data, as: UTF8.self))
+if arguments.count > 2 && arguments[1] == "volume-scroll" {
+    // Concurrent launches would overwrite each other's volume, so the resident helper applies every notch.
+    guard let command = PopupCommand(arguments[1], argument: arguments[2]) else {
+        logger.error("Invalid scroll delta: \(arguments[2], privacy: .public)")
+        exit(EXIT_FAILURE)
+    }
+    command.post()
+} else if arguments.count > 1 && arguments[1] == "mute-toggle" {
+    do { try Audio.setMuted(!Audio.muted(Audio.current)) }
+    catch { logger.error("Toggling mute failed: \(error.localizedDescription, privacy: .public)"); exit(EXIT_FAILURE) }
 } else if arguments.count > 1 && arguments[1] == "notch" {
     // notch.sh reads this. null means the bar's display has no camera housing.
     let size = Notch.main.map { ["width": Int($0.width.rounded()), "height": Int($0.height.rounded())] }
     let data = try JSONEncoder().encode(size)
     print(String(decoding: data, as: UTF8.self))
 } else if arguments.count > 1 && arguments[1] == PopupCommand.hoverEnd.rawValue {
-    DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": PopupCommand.hoverEnd.rawValue], deliverImmediately: true)
-} else if arguments.count > 1 && arguments[1] == "media-state" {
-    runCLI {
-        let snapshot = try await Media.read()
-        let data = try JSONEncoder().encode(snapshot)
-        print(String(decoding: data, as: UTF8.self))
-    }
+    PopupCommand.hoverEnd.post()
 } else if arguments.count > 2 && arguments[1] == "media" {
     guard let action = MediaAction(rawValue: arguments[2]) else {
         logger.error("Unknown media command: \(arguments[2])")
         exit(EXIT_FAILURE)
     }
     runCLI { try await Media.perform(action) }
-} else if arguments.count > 1 && arguments[1] == "tailscale-state" {
-    runCLI {
-        let data = try await JSONEncoder().encode(["kind": Tailscale.kind()])
-        print(String(decoding: data, as: UTF8.self))
-    }
 } else if arguments.count > 1 && arguments[1] == PopupCommand.stop.rawValue {
-    DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": PopupCommand.stop.rawValue], deliverImmediately: true)
+    PopupCommand.stop.post()
     // sketchybarrc starts a helper right after this. Wait up to 2 s for the running one to
     // release its lock, so that command is not handed to a process that is exiting.
     guard let source = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("popup.swift") else { exit(EXIT_FAILURE) }
@@ -2235,7 +2964,7 @@ if arguments.count > 1 && arguments[1] == "audio" {
     delegate.lock = open(delegate.theme.configDirectory + "/plugins/popup.swift", O_RDONLY)
     guard delegate.lock >= 0 else { exit(1) }
     if flock(delegate.lock, LOCK_EX | LOCK_NB) != 0 {
-        DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": command.rawValue], deliverImmediately: true)
+        command.post()
         exit(0)
     }
     app.delegate = delegate

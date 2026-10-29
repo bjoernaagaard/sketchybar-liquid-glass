@@ -21,7 +21,10 @@ if [ "$1" = build ]; then
   exit 0
 fi
 
-export CONFIG_DIR TEXT TEXT2 TEXT3 BAR_COLOR BAR_EDGE ISLAND_COLOR
+# Right click on volume toggles mute instead of opening the popup.
+[ "$1" = volume ] && [ "$BUTTON" = right ] && exec "$HELPER" mute-toggle
+
+export CONFIG_DIR TEXT TEXT2 TEXT3 BAR_COLOR BAR_EDGE ISLAND_COLOR WARN CRIT
 export POPUP_RADIUS POPUP_WIDTH POPUP_GAP POPUP_PADDING POPUP_ROW CALENDAR_TODAY_SIZE
 export ISLAND_WING ISLAND_RADIUS ISLAND_RESPONSE
 export SB="$(command -v "$SB")"

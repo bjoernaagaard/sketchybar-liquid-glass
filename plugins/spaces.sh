@@ -1,17 +1,71 @@
 #!/bin/bash
 # Redraws every workspace pill and the front app from one AeroSpace snapshot.
 source "$CONFIG_DIR/theme.sh"
+honor_reduce_motion
 
 focused=${FOCUSED_WORKSPACE:-$(aerospace list-workspaces --focused)}
 windows=$(aerospace list-windows --all --format '%{workspace}|%{app-bundle-id}')
 IFS='|' read -r front_id front_name < <(aerospace list-windows --focused --format '%{app-bundle-id}|%{app-name}' 2>/dev/null)
+workspaces=$(aerospace list-workspaces --all 2>/dev/null)
+
+# AeroSpace may send no event when it starts after the bar, so one chain asks again every 2 s
+# for up to a minute. The directory marks a running chain, so other events don't start more.
+pending="${TMPDIR:-/tmp}/sketchybar-spaces-retry"
+retry=${SPACES_RETRY:-0}
+if [ -n "$workspaces" ]; then
+  rmdir "$pending" 2>/dev/null
+elif [ -n "${SPACES_RETRY:-}" ] || mkdir "$pending" 2>/dev/null; then
+  if [ "$retry" -lt 30 ]; then (sleep 2; $SB --trigger aerospace_focus_change SPACES_RETRY=$((retry + 1))) &
+  else rmdir "$pending" 2>/dev/null; fi
+fi
+
+# The bar does not wait for AeroSpace. The first snapshot after it answers builds any missing pill,
+# then moves every pill before mode in AeroSpace's order. A pill whose workspace is gone is removed.
+bar=$($SB --query bar)
+add=()
+if [ -n "$workspaces" ]; then
+  for item in $(jq -r '.items[] | select(test("^ws\\.[^.]+$"))' <<< "$bar"); do
+    case " $(echo $workspaces) " in *" ${item#ws.} "*) ;; *) add+=(--remove "/^ws\\.${item#ws.}\\./" --remove "$item") ;; esac
+  done
+fi
+order=()
+for ws in $workspaces; do
+  members=("ws.$ws")
+  for ((i = 0; i < MAX_APPS; i++)); do members+=("ws.$ws.a$i"); done
+  members+=("ws.$ws.end")
+  # Only the first pill goes without a 2 pt gap before it, whichever workspace is first now.
+  gap=()
+  if [ ${#order[@]} = 0 ]; then
+    [[ $bar == *"\"ws.$ws.gap\""* ]] && add+=(--remove "ws.$ws.gap")
+  else
+    gap=("ws.$ws.gap")
+    [[ $bar == *"\"ws.$ws.gap\""* ]] || add+=(--add item "$gap" left --set "$gap" width=2)
+  fi
+  order+=("${gap[@]}" "${members[@]}" "ws.$ws.pill")
+  [[ $bar == *"\"ws.$ws\""* ]] && continue
+  add+=(--add item "ws.$ws" left
+        --set "ws.$ws" label="$ws" label.color=$TEXT3 label.padding_left=8 label.padding_right=8
+                       background.drawing=off click_script="aerospace workspace $ws")
+  for ((i = 0; i < MAX_APPS; i++)); do
+    add+=(--add item "ws.$ws.a$i" left
+          --set "ws.$ws.a$i" drawing=off width=0 background.drawing=on
+                             background.image.scale=$ICON_SCALE click_script="aerospace workspace $ws")
+  done
+  add+=(--add item "ws.$ws.end" left --set "ws.$ws.end" width=0
+        --add bracket "ws.$ws.pill" "${members[@]}"
+        --set "ws.$ws.pill" background.color=$CLEAR background.height=22 background.corner_radius=8)
+done
+if [ ${#add[@]} -gt 0 ]; then
+  for item in "${order[@]}"; do add+=(--move "$item" before mode); done
+  $SB "${add[@]}"
+fi
 
 now=()    # images, visibility, text: cannot animate
 sizes=()  # widths
 colors=()
 collapsing=()
 
-for ws in $(aerospace list-workspaces --all); do
+for ws in $workspaces; do
   apps=()
   while IFS='|' read -r window_ws id; do
     [ "$window_ws" = "$ws" ] && [ -n "$id" ] || continue

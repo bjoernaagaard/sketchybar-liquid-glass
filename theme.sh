@@ -11,12 +11,18 @@ CLEAR=0x00ffffff
 BAR_COLOR=0xe61e2023
 BAR_EDGE=0x1fffffff
 ISLAND_COLOR=0xff000000
+# Apple's dark-mode system yellow and red, for readings under strain.
+WARN=0xffffd60a
+CRIT=0xffff453a
 
-# macOS Reduce Motion: sizes jump, colors still fade
-[ "$(defaults read com.apple.universalaccess reduceMotion 2>/dev/null)" = 1 ] && REDUCE_MOTION=1 || REDUCE_MOTION=0
 SIZE_ANIM=(--animate tanh 12)
-[ "$REDUCE_MOTION" = 1 ] && SIZE_ANIM=()
 COLOR_ANIM=(--animate tanh 10)
+
+# macOS Reduce Motion makes sizes jump while colors still fade. Reading it launches a process,
+# so only a script that animates size calls this.
+honor_reduce_motion() {
+  if [ "$(defaults read com.apple.universalaccess reduceMotion 2>/dev/null)" = 1 ]; then SIZE_ANIM=(); fi
+}
 
 # Layout. An item with an explicit width ignores its padding, so every gap below is a width.
 # App icon artwork fills about 80% of its canvas: scale 0.64 draws 16 pt of visible icon.

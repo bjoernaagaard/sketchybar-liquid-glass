@@ -3,6 +3,10 @@
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/sketchybar}"
 source "$CONFIG_DIR/theme.sh"
 PLUGIN_DIR="$CONFIG_DIR/plugins"
+# hover.sh records which system half is under the pointer, and spaces.sh marks a running retry chain.
+# A restart can leave either behind.
+rm -f "${TMPDIR:-/tmp}"/sketchybar-hover.system.*
+rmdir "${TMPDIR:-/tmp}/sketchybar-spaces-retry" 2>/dev/null
 "$PLUGIN_DIR/popup.sh" build || exit 1
 
 # notch.sh switches to BAR_NOTCH when the main display has a camera housing.
@@ -17,31 +21,21 @@ a+=(--default updates=when_shown
 
 a+=(--add event aerospace_workspace_change
     --add event aerospace_focus_change
-    --add event tailscale_change
-    --add event media_change
-    --add event notch_change)
+    --add event aerospace_mode_change
+    --add event notch_change
+    --add event volume_state
+    --add event network_state
+    --add event media_state
+    --add event tailscale_state
+    --add event system_state)
 
 gap() { a+=(--add item "$1" left --set "$1" width=$2); }
 
-first=1
-for ws in $(aerospace list-workspaces --all); do
-  [ $first = 1 ] || gap "ws.$ws.gap" 2
-  first=0
-  members=("ws.$ws")
-  a+=(--add item "ws.$ws" left
-      --set "ws.$ws" label="$ws" label.color=$TEXT3 label.padding_left=8 label.padding_right=8
-                     background.drawing=off click_script="aerospace workspace $ws")
-  for ((i = 0; i < MAX_APPS; i++)); do
-    members+=("ws.$ws.a$i")
-    a+=(--add item "ws.$ws.a$i" left
-        --set "ws.$ws.a$i" drawing=off width=0 background.drawing=on
-                           background.image.scale=$ICON_SCALE click_script="aerospace workspace $ws")
-  done
-  gap "ws.$ws.end" 0
-  members+=("ws.$ws.end")
-  a+=(--add bracket "ws.$ws.pill" "${members[@]}"
-      --set "ws.$ws.pill" background.color=$CLEAR background.height=22 background.corner_radius=8)
-done
+# AeroSpace can start after SketchyBar at login, so spaces.sh builds the workspace pills before mode.
+a+=(--add item mode left
+    --set mode drawing=off updates=on padding_left=2 label.color=$TEXT label.padding_left=8 label.padding_right=8
+               background.drawing=on background.color=$PILL script="$PLUGIN_DIR/status.sh"
+    --subscribe mode aerospace_mode_change)
 
 gap sep.l 6
 a+=(--add item sep left
@@ -60,6 +54,8 @@ a+=(--add item spaces left
     --subscribe front mouse.entered mouse.exited)
 
 # right side is added right to left
+# The resident helper pushes volume, media, network, tailscale, and system with <item>_state events.
+# updates=on keeps a push from being dropped while an item is not shown.
 a+=(--add item clock right
     --set clock icon.color=$TEXT2 icon.font="$FONT:Medium:13.0" icon.padding_left=8 icon.padding_right=6 label.padding_right=8
                 update_freq=10 script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh clock"
@@ -72,27 +68,40 @@ a+=(--add item clock right
 
     --add item volume right
     --set volume icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
-                 script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh volume" update_freq=2
-    --subscribe volume volume_change system_woke mouse.entered mouse.exited
+                 updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh volume"
+    --subscribe volume volume_state mouse.scrolled mouse.entered mouse.exited
 
     --add item media center
     --set media icon.padding_left=8 icon.padding_right=6 label.padding_right=8 label.max_chars=40
-                 update_freq=2 script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh media"
-    --subscribe media media_change system_woke mouse.entered mouse.exited
+                 updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh media"
+    --subscribe media media_state mouse.entered mouse.exited
 
     --add item notch center
     --set notch drawing=off updates=on script="$PLUGIN_DIR/notch.sh"
     --subscribe notch notch_change system_woke
 
     --add item network right
-    --set network icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=5 script="$PLUGIN_DIR/status.sh"
+    --set network icon.padding_left=8 icon.padding_right=8 label.drawing=off updates=on script="$PLUGIN_DIR/status.sh"
                   click_script="$PLUGIN_DIR/popup.sh network"
-    --subscribe network wifi_change system_woke mouse.entered mouse.exited
+    --subscribe network network_state mouse.entered mouse.exited
 
     --add item tailscale right
-    --set tailscale icon.padding_left=8 icon.padding_right=8 label.drawing=off update_freq=5 script="$PLUGIN_DIR/status.sh"
+    --set tailscale icon.padding_left=8 icon.padding_right=8 label.drawing=off updates=on script="$PLUGIN_DIR/status.sh"
                     click_script="$PLUGIN_DIR/popup.sh tailscale"
-    --subscribe tailscale tailscale_change wifi_change system_woke mouse.entered mouse.exited)
+    --subscribe tailscale tailscale_state mouse.entered mouse.exited
+
+    --add item system.memory right
+    --set system.memory icon.padding_left=5 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
+                        updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh system"
+    --subscribe system.memory mouse.entered mouse.exited
+
+    --add item system.cpu right
+    --set system.cpu icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=5
+                     updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh system"
+    --subscribe system.cpu system_state mouse.entered mouse.exited
+
+    --add bracket system system.cpu system.memory
+    --set system background.color=$CLEAR background.height=22 background.corner_radius=8)
 
 $SB "${a[@]}"
 # The resident helper draws the island on a notched display and reports display changes.

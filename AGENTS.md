@@ -17,7 +17,7 @@ For interface or motion changes, also read `~/.agents/skills/apple-design/SKILL.
 - Validate external input at boundaries. Throw recoverable errors with context. Use preconditions only for programmer mistakes. A force unwrap needs a stated invariant. Preserve existing user-facing wording unless a wording change is requested.
 - Decode popup commands and network kinds into enums. Exhaustive switches must force new features to handle both opening and refreshing. Convert to strings only at shell, JSON, or distributed-notification boundaries. Distributed notifications are cross-process messages, not local typed NotificationCenter messages.
 - Keep unsafe memory access inside the CoreAudio and system-call boundary. Audio scalar reads and writes require `BitwiseCopyable` values. Keep pointers scoped, release allocated buffers with `defer`, and use Address Sanitizer when changing this boundary.
-- Use `Logger` from `os` for diagnostics and keep personal data private. The JSON output of `audio` and `network-state` is a machine interface, so it must remain on stdout without diagnostic text mixed in.
+- Use `Logger` from `os` for diagnostics and keep personal data private. The JSON output of `notch` and the `<item>_state` trigger variables are machine interfaces, so keep diagnostic text out of them.
 - Use the system frameworks already present. Ask before adding a package. The existing Foundation `Process` usage is not permission to install Subprocess or another dependency.
 
 ## Existing project boundaries
