@@ -6,13 +6,45 @@ honor_reduce_motion
 focused=${FOCUSED_WORKSPACE:-$(aerospace list-workspaces --focused)}
 windows=$(aerospace list-windows --all --format '%{workspace}|%{app-bundle-id}')
 IFS='|' read -r front_id front_name < <(aerospace list-windows --focused --format '%{app-bundle-id}|%{app-name}' 2>/dev/null)
+workspaces=$(aerospace list-workspaces --all 2>/dev/null)
+
+# The bar does not wait for AeroSpace. The first snapshot after it answers builds any missing pill,
+# then moves every pill before mode in AeroSpace's order.
+bar=$($SB --query bar)
+add=()
+order=()
+for ws in $workspaces; do
+  members=("ws.$ws")
+  for ((i = 0; i < MAX_APPS; i++)); do members+=("ws.$ws.a$i"); done
+  members+=("ws.$ws.end")
+  gap=()
+  [ ${#order[@]} = 0 ] || gap=("ws.$ws.gap")
+  order+=("${gap[@]}" "${members[@]}" "ws.$ws.pill")
+  [[ $bar == *"\"ws.$ws\""* ]] && continue
+  [ ${#gap[@]} = 0 ] || add+=(--add item "$gap" left --set "$gap" width=2)
+  add+=(--add item "ws.$ws" left
+        --set "ws.$ws" label="$ws" label.color=$TEXT3 label.padding_left=8 label.padding_right=8
+                       background.drawing=off click_script="aerospace workspace $ws")
+  for ((i = 0; i < MAX_APPS; i++)); do
+    add+=(--add item "ws.$ws.a$i" left
+          --set "ws.$ws.a$i" drawing=off width=0 background.drawing=on
+                             background.image.scale=$ICON_SCALE click_script="aerospace workspace $ws")
+  done
+  add+=(--add item "ws.$ws.end" left --set "ws.$ws.end" width=0
+        --add bracket "ws.$ws.pill" "${members[@]}"
+        --set "ws.$ws.pill" background.color=$CLEAR background.height=22 background.corner_radius=8)
+done
+if [ ${#add[@]} -gt 0 ]; then
+  for item in "${order[@]}"; do add+=(--move "$item" before mode); done
+  $SB "${add[@]}"
+fi
 
 now=()    # images, visibility, text: cannot animate
 sizes=()  # widths
 colors=()
 collapsing=()
 
-for ws in $(aerospace list-workspaces --all); do
+for ws in $workspaces; do
   apps=()
   while IFS='|' read -r window_ws id; do
     [ "$window_ws" = "$ws" ] && [ -n "$id" ] || continue

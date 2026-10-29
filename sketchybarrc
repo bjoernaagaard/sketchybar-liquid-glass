@@ -27,32 +27,7 @@ a+=(--add event aerospace_workspace_change
 
 gap() { a+=(--add item "$1" left --set "$1" width=$2); }
 
-# AeroSpace can start after SketchyBar at login. Wait up to 30 s so the pills exist.
-for ((try = 0; try < 30; try++)); do
-  workspaces=$(aerospace list-workspaces --all 2>/dev/null) && [ -n "$workspaces" ] && break
-  sleep 1
-done
-
-first=1
-for ws in $workspaces; do
-  [ $first = 1 ] || gap "ws.$ws.gap" 2
-  first=0
-  members=("ws.$ws")
-  a+=(--add item "ws.$ws" left
-      --set "ws.$ws" label="$ws" label.color=$TEXT3 label.padding_left=8 label.padding_right=8
-                     background.drawing=off click_script="aerospace workspace $ws")
-  for ((i = 0; i < MAX_APPS; i++)); do
-    members+=("ws.$ws.a$i")
-    a+=(--add item "ws.$ws.a$i" left
-        --set "ws.$ws.a$i" drawing=off width=0 background.drawing=on
-                           background.image.scale=$ICON_SCALE click_script="aerospace workspace $ws")
-  done
-  gap "ws.$ws.end" 0
-  members+=("ws.$ws.end")
-  a+=(--add bracket "ws.$ws.pill" "${members[@]}"
-      --set "ws.$ws.pill" background.color=$CLEAR background.height=22 background.corner_radius=8)
-done
-
+# AeroSpace can start after SketchyBar at login, so spaces.sh builds the workspace pills before mode.
 a+=(--add item mode left
     --set mode drawing=off updates=on padding_left=2 label.color=$TEXT label.padding_left=8 label.padding_right=8
                background.drawing=on background.color=$PILL script="$PLUGIN_DIR/status.sh"
