@@ -17,14 +17,21 @@ a+=(--default updates=when_shown
 
 a+=(--add event aerospace_workspace_change
     --add event aerospace_focus_change
+    --add event aerospace_mode_change
     --add event tailscale_change
     --add event media_change
     --add event notch_change)
 
 gap() { a+=(--add item "$1" left --set "$1" width=$2); }
 
+# AeroSpace can start after SketchyBar at login. Wait up to 30 s so the pills exist.
+for ((try = 0; try < 30; try++)); do
+  workspaces=$(aerospace list-workspaces --all 2>/dev/null) && [ -n "$workspaces" ] && break
+  sleep 1
+done
+
 first=1
-for ws in $(aerospace list-workspaces --all); do
+for ws in $workspaces; do
   [ $first = 1 ] || gap "ws.$ws.gap" 2
   first=0
   members=("ws.$ws")
@@ -42,6 +49,11 @@ for ws in $(aerospace list-workspaces --all); do
   a+=(--add bracket "ws.$ws.pill" "${members[@]}"
       --set "ws.$ws.pill" background.color=$CLEAR background.height=22 background.corner_radius=8)
 done
+
+a+=(--add item mode left
+    --set mode drawing=off updates=on padding_left=2 label.color=$TEXT label.padding_left=8 label.padding_right=8
+               background.drawing=on background.color=$PILL script="$PLUGIN_DIR/status.sh"
+    --subscribe mode aerospace_mode_change)
 
 gap sep.l 6
 a+=(--add item sep left

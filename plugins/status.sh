@@ -11,6 +11,12 @@ esac
 source "$CONFIG_DIR/theme.sh"
 
 case "$NAME" in
+  mode)
+    mode=$(aerospace list-modes --current)
+    if [ -z "$mode" ] || [ "$mode" = main ]; then $SB --set mode drawing=off
+    else $SB --set mode drawing=on label="$mode"; fi
+    ;;
+
   clock)
     IFS='|' read -r day time < <(date '+%a %-d %b|%H:%M')
     $SB --set clock icon="$day" label="$time"

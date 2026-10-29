@@ -1,6 +1,7 @@
 #!/bin/bash
 # Redraws every workspace pill and the front app from one AeroSpace snapshot.
 source "$CONFIG_DIR/theme.sh"
+honor_reduce_motion
 
 focused=${FOCUSED_WORKSPACE:-$(aerospace list-workspaces --focused)}
 windows=$(aerospace list-windows --all --format '%{workspace}|%{app-bundle-id}')
