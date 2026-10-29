@@ -14,10 +14,14 @@ enum PopupKind: String {
 
 // Commands for the running helper. Strings exist only at the shell and notification boundary.
 enum PopupCommand {
-    case toggle(PopupKind), hover, hoverEnd, start, stop
+    case toggle(PopupKind), hover, hoverEnd, start, stop, volumeScroll(notches: Int)
 
-    init?(_ raw: String) {
+    init?(_ raw: String, argument: String? = nil) {
         switch raw {
+        case "volume-scroll":
+            // status.sh passes SketchyBar's SCROLL_DELTA.
+            guard let argument, let delta = Double(argument), delta.isFinite else { return nil }
+            self = .volumeScroll(notches: Int(min(50, max(-50, delta)).rounded()))
         case "media-hover": self = .hover
         case "media-hover-end": self = .hoverEnd
         case "start": self = .start
@@ -35,7 +39,24 @@ enum PopupCommand {
         case .hoverEnd: "media-hover-end"
         case .start: "start"
         case .stop: "stop"
+        case .volumeScroll: "volume-scroll"
         }
+    }
+
+    var userInfo: [String: String] {
+        switch self {
+        case .volumeScroll(let notches): ["item": rawValue, "argument": String(notches)]
+        case .toggle, .hover, .hoverEnd, .start, .stop: ["item": rawValue]
+        }
+    }
+
+    init?(userInfo: [AnyHashable: Any]?) {
+        guard let raw = userInfo?["item"] as? String else { return nil }
+        self.init(raw, argument: userInfo?["argument"] as? String)
+    }
+
+    func post() {
+        DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: userInfo, deliverImmediately: true)
     }
 }
 
@@ -1757,8 +1778,16 @@ final class Popups: NSObject, NSApplicationDelegate {
         switch initialCommand {
         case .toggle(let popup): toggle(popup)
         case .hover: show(.media)
+        case .volumeScroll(let notches): scrollVolume(notches)
         case .start, .hoverEnd, .stop: break
         }
+    }
+
+    // Each notch moves the volume 2 percentage points. Notifications arrive one at a time on the main
+    // actor, so each notch starts from the volume the previous one wrote.
+    func scrollVolume(_ notches: Int) {
+        do { try Audio.change(by: 2 * notches) }
+        catch { logger.error("Changing the volume failed: \(error.localizedDescription, privacy: .public)") }
     }
 
     @objc func woke() { bar.pushAll() }
@@ -1828,9 +1857,10 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     @objc func receive(_ notification: Notification) {
-        guard let raw = notification.userInfo?["item"] as? String, let command = PopupCommand(raw) else { return }
+        guard let command = PopupCommand(userInfo: notification.userInfo) else { return }
         switch command {
         case .stop: NSApp.terminate(nil)
+        case .volumeScroll(let notches): scrollVolume(notches)
         case .hover: show(.media)
         case .hoverEnd: if item == .media { hoverCanClose = true }
         case .start: bar.pushAll()
@@ -2872,13 +2902,12 @@ func runCLI(_ operation: @escaping () async throws -> Void) -> Never {
 
 let arguments = CommandLine.arguments
 if arguments.count > 2 && arguments[1] == "volume-scroll" {
-    // status.sh passes SketchyBar's SCROLL_DELTA. Each notch moves the volume 2 percentage points.
-    guard let delta = Double(arguments[2]), delta.isFinite else {
+    // Concurrent launches would overwrite each other's volume, so the resident helper applies every notch.
+    guard let command = PopupCommand(arguments[1], argument: arguments[2]) else {
         logger.error("Invalid scroll delta: \(arguments[2], privacy: .public)")
         exit(EXIT_FAILURE)
     }
-    do { try Audio.change(by: 2 * Int(min(50, max(-50, delta)).rounded())) }
-    catch { logger.error("Changing the volume failed: \(error.localizedDescription, privacy: .public)"); exit(EXIT_FAILURE) }
+    command.post()
 } else if arguments.count > 1 && arguments[1] == "mute-toggle" {
     do { try Audio.setMuted(!Audio.muted(Audio.current)) }
     catch { logger.error("Toggling mute failed: \(error.localizedDescription, privacy: .public)"); exit(EXIT_FAILURE) }
@@ -2888,7 +2917,7 @@ if arguments.count > 2 && arguments[1] == "volume-scroll" {
     let data = try JSONEncoder().encode(size)
     print(String(decoding: data, as: UTF8.self))
 } else if arguments.count > 1 && arguments[1] == PopupCommand.hoverEnd.rawValue {
-    DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": PopupCommand.hoverEnd.rawValue], deliverImmediately: true)
+    PopupCommand.hoverEnd.post()
 } else if arguments.count > 2 && arguments[1] == "media" {
     guard let action = MediaAction(rawValue: arguments[2]) else {
         logger.error("Unknown media command: \(arguments[2])")
@@ -2896,7 +2925,7 @@ if arguments.count > 2 && arguments[1] == "volume-scroll" {
     }
     runCLI { try await Media.perform(action) }
 } else if arguments.count > 1 && arguments[1] == PopupCommand.stop.rawValue {
-    DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": PopupCommand.stop.rawValue], deliverImmediately: true)
+    PopupCommand.stop.post()
     // sketchybarrc starts a helper right after this. Wait up to 2 s for the running one to
     // release its lock, so that command is not handed to a process that is exiting.
     guard let source = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("popup.swift") else { exit(EXIT_FAILURE) }
@@ -2921,7 +2950,7 @@ if arguments.count > 2 && arguments[1] == "volume-scroll" {
     delegate.lock = open(delegate.theme.configDirectory + "/plugins/popup.swift", O_RDONLY)
     guard delegate.lock >= 0 else { exit(1) }
     if flock(delegate.lock, LOCK_EX | LOCK_NB) != 0 {
-        DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": command.rawValue], deliverImmediately: true)
+        command.post()
         exit(0)
     }
     app.delegate = delegate
