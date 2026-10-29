@@ -8,10 +8,21 @@ windows=$(aerospace list-windows --all --format '%{workspace}|%{app-bundle-id}')
 IFS='|' read -r front_id front_name < <(aerospace list-windows --focused --format '%{app-bundle-id}|%{app-name}' 2>/dev/null)
 workspaces=$(aerospace list-workspaces --all 2>/dev/null)
 
+# AeroSpace may send no event when it starts after the bar, so ask again every 2 s for up to a minute.
+retry=${SPACES_RETRY:-0}
+if [ -z "$workspaces" ] && [ "$retry" -lt 30 ]; then
+  (sleep 2; $SB --trigger aerospace_focus_change SPACES_RETRY=$((retry + 1))) &
+fi
+
 # The bar does not wait for AeroSpace. The first snapshot after it answers builds any missing pill,
-# then moves every pill before mode in AeroSpace's order.
+# then moves every pill before mode in AeroSpace's order. A pill whose workspace is gone is removed.
 bar=$($SB --query bar)
 add=()
+if [ -n "$workspaces" ]; then
+  for item in $(jq -r '.items[] | select(test("^ws\\.[^.]+$"))' <<< "$bar"); do
+    case " $(echo $workspaces) " in *" ${item#ws.} "*) ;; *) add+=(--remove "/^ws\\.${item#ws.}\\./" --remove "$item") ;; esac
+  done
+fi
 order=()
 for ws in $workspaces; do
   members=("ws.$ws")
