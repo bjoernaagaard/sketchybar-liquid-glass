@@ -38,7 +38,7 @@ enum PopupCommand {
     }
 }
 
-enum NetworkKind: String, Codable {
+enum NetworkKind: String {
     case ethernet, wifi, network, none
 }
 
@@ -143,10 +143,24 @@ struct Audio {
         try set(system, address(kAudioHardwarePropertyDefaultOutputDevice), id)
     }
 
-    static func snapshot() -> [String: Any] {
-        let id = current
-        return ["current": id, "volume": volume(id).map { Int(($0 * 100).rounded()) } as Any? ?? NSNull(),
-                "muted": muted(id), "devices": devices().map { ["id": $0.id, "name": $0.name] as [String: Any] }]
+    static func change(by points: Int) throws {
+        guard let value = volume(current) else { return }
+        try setVolume(Float(Int((value * 100).rounded()) + points) / 100)
+    }
+
+    // CoreAudio removes a listener only when given the same block object it was added with.
+    typealias Listener = @convention(block) (UInt32, UnsafePointer<AudioObjectPropertyAddress>) -> Void
+
+    // The listener runs on the main queue.
+    static func listen(_ id: AudioObjectID, _ address: AudioObjectPropertyAddress, _ listener: @escaping Listener) -> Bool {
+        var address = address
+        return AudioObjectAddPropertyListenerBlock(id, &address, .main, listener) == noErr
+    }
+
+    static func unlisten(_ id: AudioObjectID, _ address: AudioObjectPropertyAddress, _ listener: @escaping Listener) {
+        var address = address
+        let status = AudioObjectRemovePropertyListenerBlock(id, &address, .main, listener)
+        if status != noErr { logger.error("Removing an audio listener failed with status \(status, privacy: .public).") }
     }
 }
 
@@ -199,7 +213,7 @@ struct PendingMediaSeek {
     let trackSignature: [String]
 }
 
-struct MediaSnapshot: Codable, Equatable {
+struct MediaSnapshot: Decodable, Equatable {
     let title: String
     let artist: String
     let bundleIdentifier: String
@@ -394,7 +408,7 @@ struct Media {
 
 }
 
-struct NetworkConnection: Codable, Equatable {
+struct NetworkConnection: Equatable {
     let name: String
     let interface: String
     let kind: NetworkKind
@@ -403,9 +417,29 @@ struct NetworkConnection: Codable, Equatable {
     let primary: Bool
 }
 
-struct NetworkState: Codable, Equatable {
+struct NetworkState: Equatable {
     let connections: [NetworkConnection]
     let kind: NetworkKind
+
+    // The patterns cover every key `read` uses, plus service setup for enabling and disabling.
+    static let watchedKeys = ["State:/Network/Global/IPv[46]", "State:/Network/Service/.*/IPv[46]",
+                              "State:/Network/Interface/.*/Link", "Setup:/Network/Service/.*"]
+
+    // Calls `owner.networkChanged()` from a source on the main run loop. The owner invalidates
+    // the source before it goes away, so the unretained pointer never outlives it.
+    static func watch(_ owner: BarFeed) -> (store: SCDynamicStore, source: CFRunLoopSource)? {
+        var context = SCDynamicStoreContext(version: 0, info: Unmanaged.passUnretained(owner).toOpaque(),
+                                            retain: nil, release: nil, copyDescription: nil)
+        guard let store = SCDynamicStoreCreate(nil, "SketchyBar" as CFString, { _, _, info in
+            guard let info else { return }
+            // The run loop source is added only to the main run loop.
+            MainActor.assumeIsolated { Unmanaged<BarFeed>.fromOpaque(info).takeUnretainedValue().networkChanged() }
+        }, &context),
+              SCDynamicStoreSetNotificationKeys(store, nil, watchedKeys as CFArray),
+              let source = SCDynamicStoreCreateRunLoopSource(nil, store, 0) else { return nil }
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        return (store, source)
+    }
 
     static func read() -> NetworkState? {
         guard let preferences = SCPreferencesCreate(nil, "SketchyBar" as CFString, nil),
@@ -465,9 +499,17 @@ enum TailscaleError: LocalizedError {
     }
 }
 
-// Values the bar item renders. Strings appear only at the JSON boundary with status.sh.
-enum TailscaleKind: String, Codable {
+// Values the bar item renders. Strings appear only at the trigger boundary with status.sh.
+enum TailscaleKind: String {
     case running, exitNode = "exit-node", stopped, login, unavailable
+
+    init(_ status: TailscaleStatus) {
+        switch status.backend {
+        case .running: self = status.peers.contains { $0.exitNode } ? .exitNode : .running
+        case .needsLogin, .needsMachineAuth: self = .login
+        case .stopped, .starting, .noState: self = .stopped
+        }
+    }
 }
 
 enum TailscaleBackend: String, Decodable {
@@ -603,11 +645,7 @@ struct Tailscale: Equatable {
         guard let executable = try? executable(),
               let result = try? await ProcessCapture().run(executable, ["status", "--json"]),
               let status = try? decode(TailscaleStatus.self, arguments: ["status", "--json"], result: result) else { return .unavailable }
-        switch status.backend {
-        case .running: return status.peers.contains { $0.exitNode } ? .exitNode : .running
-        case .needsLogin, .needsMachineAuth: return .login
-        case .stopped, .starting, .noState: return .stopped
-        }
+        return TailscaleKind(status)
     }
 
 }
@@ -884,7 +922,6 @@ final class Island: NSObject {
     private var height = Spring(0)
     private var link: CADisplayLink?
     private var lastStep: CFTimeInterval?
-    private var stream: Task<Void, Never>?
 
     init(theme: Theme, popups: Popups) {
         self.theme = theme
@@ -923,8 +960,6 @@ final class Island: NSObject {
         guard next != notch else { return false }
         notch = next
         guard let next else {
-            stream?.cancel()
-            stream = nil
             media = nil
             stopLink()
             shape = .hidden
@@ -945,13 +980,10 @@ final class Island: NSObject {
         width = Spring(size.width)
         height = Spring(size.height)
         render()
-        startStream()
         return true
     }
 
     func stop() {
-        stream?.cancel()
-        stream = nil
         stopLink()
     }
 
@@ -978,7 +1010,7 @@ final class Island: NSObject {
         move(to: media == nil ? .hidden : .compact)
     }
 
-    private func apply(_ snapshot: MediaSnapshot?) {
+    func apply(_ snapshot: MediaSnapshot?) {
         let next = snapshot?.title.isEmpty == false ? snapshot : nil
         if next?.artworkData != media?.artworkData || artwork.layer?.contents == nil {
             let image = next?.artworkData.flatMap(NSImage.init(data:))
@@ -1008,30 +1040,6 @@ final class Island: NSObject {
         guard let color = pixel.colorAt(x: 0, y: 0)?.usingColorSpace(.deviceRGB), color.saturationComponent > 0.15 else { return nil }
         return NSColor(hue: color.hueComponent, saturation: min(1, color.saturationComponent * 1.2),
                        brightness: max(0.8, color.brightnessComponent), alpha: 1)
-    }
-
-    private func startStream() {
-        guard stream == nil else { return }
-        stream = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    let executable = try Media.executable()
-                    _ = try await ProcessCapture().run(executable, ["stream", "--no-diff", "--debounce=100"]) { line in
-                        guard let event = try? JSONDecoder().decode(MediaStreamEvent.self, from: line) else { return }
-                        self?.apply(event.payload)
-                    }
-                } catch is CancellationError {
-                    return
-                } catch MediaError.missingCLI {
-                    logger.error("Island media stream needs media-control on PATH.")
-                    return
-                } catch {
-                    logger.error("Island media stream failed: \(error.localizedDescription, privacy: .private)")
-                }
-                // The stream ends when media-control or its system service restarts.
-                try? await Task.sleep(for: .seconds(5))
-            }
-        }
     }
 
     private func size(_ shape: Shape) -> NSSize {
@@ -1142,6 +1150,131 @@ struct CalendarEvent {
     let color: NSColor
 }
 
+// What a bar item shows. Strings exist only in `variables`, at the sketchybar trigger boundary.
+enum BarState: Equatable {
+    case volume(percent: Int?, muted: Bool)
+    case network(NetworkKind)
+    case media(title: String, artist: String, playing: Bool)
+    case mediaUnavailable
+    case tailscale(TailscaleKind)
+
+    // Each item subscribes to its own event in sketchybarrc, and status.sh reads the variables.
+    var event: String {
+        switch self {
+        case .volume: "volume_state"
+        case .network: "network_state"
+        case .media, .mediaUnavailable: "media_state"
+        case .tailscale: "tailscale_state"
+        }
+    }
+
+    var variables: [String] {
+        switch self {
+        case .volume(let percent, let muted): ["VOLUME=\(percent.map(String.init) ?? "fixed")", "MUTED=\(muted)"]
+        case .network(let kind): ["KIND=\(kind.rawValue)"]
+        case .media(let title, let artist, let playing): ["MEDIA=\(playing ? "playing" : "paused")", "TITLE=\(title)", "ARTIST=\(artist)"]
+        case .mediaUnavailable: ["MEDIA=unavailable"]
+        case .tailscale(let kind): ["KIND=\(kind.rawValue)"]
+        }
+    }
+}
+
+// Watches volume, the output device, network, and Tailscale, and sends each change to the bar.
+// Popups feeds it media from the stream it shares with the island.
+final class BarFeed {
+    private let sketchybar: URL
+    private var pushed: [String: BarState] = [:]
+    private var pending: [String: BarState] = [:]
+    private var pushing: Task<Void, Never>?
+    private var audioListener: Audio.Listener?
+    private var audioDevice: AudioObjectID?
+    private var audioWatches: [(id: AudioObjectID, address: AudioObjectPropertyAddress)] = []
+    private var network: (store: SCDynamicStore, source: CFRunLoopSource)?
+    private var tailscale: Task<Void, Never>?
+
+    init(sketchybar: URL) { self.sketchybar = sketchybar }
+
+    func start() {
+        // Audio.listen delivers on the main queue, which the main actor runs on.
+        let listener: Audio.Listener = { _, _ in MainActor.assumeIsolated { self.audioChanged() } }
+        audioListener = listener
+        let device = Audio.address(kAudioHardwarePropertyDefaultOutputDevice)
+        if Audio.listen(Audio.system, device, listener) { audioWatches.append((Audio.system, device)) }
+        network = NetworkState.watch(self)
+        audioChanged()
+        networkChanged()
+        pollTailscale()
+    }
+
+    // A restarted bar or a wake gets every value again, then fresh reads.
+    func pushAll() {
+        for state in pushed.values { publish(state, force: true) }
+        audioChanged()
+        networkChanged()
+        pollTailscale()
+    }
+
+    func stop() {
+        tailscale?.cancel()
+        tailscale = nil
+        pushing?.cancel()
+        pushing = nil
+        pending.removeAll()
+        if let audioListener { for watch in audioWatches { Audio.unlisten(watch.id, watch.address, audioListener) } }
+        audioWatches.removeAll()
+        audioListener = nil
+        if let network { CFRunLoopSourceInvalidate(network.source) }
+        network = nil
+    }
+
+    // Triggers run one at a time, so the bar sees changes in order. A burst sends only the latest.
+    func publish(_ state: BarState, force: Bool = false) {
+        guard force || pushed[state.event] != state else { return }
+        pushed[state.event] = state
+        pending[state.event] = state
+        guard pushing == nil else { return }
+        pushing = Task { [weak self] in
+            while !Task.isCancelled, let self, let (event, state) = self.pending.first {
+                self.pending[event] = nil
+                _ = try? await ProcessCapture().run(self.sketchybar, ["--trigger", event] + state.variables)
+            }
+            self?.pushing = nil
+        }
+    }
+
+    func networkChanged() {
+        guard let state = NetworkState.read() else { return }
+        publish(.network(state.kind))
+    }
+
+    func pollTailscale() {
+        tailscale?.cancel()
+        tailscale = Task { [weak self] in
+            while !Task.isCancelled {
+                let kind = await Tailscale.kind()
+                guard !Task.isCancelled, let self else { return }
+                self.publish(.tailscale(kind))
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    private func audioChanged() {
+        let id = Audio.current
+        if id != audioDevice { watch(id) }
+        publish(.volume(percent: Audio.volume(id).map { Int(($0 * 100).rounded()) }, muted: Audio.muted(id)))
+    }
+
+    private func watch(_ device: AudioObjectID) {
+        guard let audioListener else { return }
+        for watch in audioWatches where watch.id != Audio.system { Audio.unlisten(watch.id, watch.address, audioListener) }
+        audioWatches.removeAll { $0.id != Audio.system }
+        audioDevice = device
+        let controls = Audio.controls(device, kAudioDevicePropertyVolumeScalar) + Audio.controls(device, kAudioDevicePropertyMute)
+        for address in controls where Audio.listen(device, address, audioListener) { audioWatches.append((device, address)) }
+    }
+}
+
 final class Popups: NSObject, NSApplicationDelegate {
     static let notification = Notification.Name("com.bjoernaagaard.sketchybar.popup")
     let theme: Theme
@@ -1187,9 +1320,14 @@ final class Popups: NSObject, NSApplicationDelegate {
     // One CLI write at a time. Its process is owned here and ended at shutdown.
     var tailscaleCommand: Task<Void, Never>?
     var tailscaleLogin = false
+    let bar: BarFeed
+    // One media-control stream feeds the bar item and, on a notched display, the island.
+    var mediaStream: Task<Void, Never>?
+    var streamedMedia: MediaSnapshot?
 
     init(theme: Theme) {
         self.theme = theme
+        bar = BarFeed(sketchybar: URL(fileURLWithPath: theme.sketchybarPath))
         super.init()
     }
 
@@ -1225,6 +1363,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             return event
         }) { monitors.append(monitor) }
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.willSleepNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(woke), name: NSWorkspace.didWakeNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(calendarChanged), name: .EKEventStoreChanged, object: nil)
@@ -1251,6 +1390,8 @@ final class Popups: NSObject, NSApplicationDelegate {
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
         island.updateNotch()
+        bar.start()
+        startMediaStream()
         switch initialCommand {
         case .toggle(let popup): toggle(popup)
         case .hover: show(.media)
@@ -1258,9 +1399,44 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc func woke() { bar.pushAll() }
+
+    func startMediaStream() {
+        guard mediaStream == nil else { return }
+        mediaStream = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    let executable = try Media.executable()
+                    _ = try await ProcessCapture().run(executable, ["stream", "--no-diff", "--debounce=100"]) { line in
+                        guard let event = try? JSONDecoder().decode(MediaStreamEvent.self, from: line) else { return }
+                        self?.streamed(event.payload)
+                    }
+                } catch is CancellationError {
+                    return
+                } catch MediaError.missingCLI {
+                    logger.error("The media stream needs media-control on PATH.")
+                    self?.bar.publish(.mediaUnavailable)
+                    return
+                } catch {
+                    logger.error("The media stream failed: \(error.localizedDescription, privacy: .private)")
+                    self?.bar.publish(.mediaUnavailable)
+                }
+                // The stream ends when media-control or its system service restarts.
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    func streamed(_ snapshot: MediaSnapshot?) {
+        streamedMedia = snapshot
+        bar.publish(.media(title: snapshot?.title ?? "", artist: snapshot?.artist ?? "", playing: snapshot?.playing ?? false))
+        if island.notch != nil { island.apply(snapshot) }
+    }
+
     @objc func screensChanged() {
         close()
         guard island.updateNotch() else { return }
+        if island.notch != nil { island.apply(streamedMedia) }
         // notch.sh moves the bar between its floating and notched layouts.
         notchTask?.cancel()
         notchTask = Task { [weak self] in await self?.trigger("notch_change") }
@@ -1276,6 +1452,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         tailscaleCommand = nil
         notchTask?.cancel()
         notchTask = nil
+        mediaStream?.cancel()
+        mediaStream = nil
+        bar.stop()
         island.stop()
         ProcessCapture.terminateRunningChildren()
         timer?.invalidate()
@@ -1292,7 +1471,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         case .stop: NSApp.terminate(nil)
         case .hover: show(.media)
         case .hoverEnd: if item == .media { hoverCanClose = true }
-        case .start: break
+        case .start: bar.pushAll()
         case .toggle(let popup): toggle(popup)
         }
     }
@@ -1651,7 +1830,6 @@ final class Popups: NSObject, NSApplicationDelegate {
                 let current = try await Media.read()
                 guard !Task.isCancelled, current?.trackSignature == signature else { return }
                 try await Media.seek(to: seconds)
-                await self.trigger("media_change")
             } catch {
                 guard !Task.isCancelled, self.item == .media, self.isOpen else { return }
                 self.pendingMediaSeek = nil
@@ -1678,7 +1856,6 @@ final class Popups: NSObject, NSApplicationDelegate {
             guard !Task.isCancelled else { return }
             do {
                 try await Media.perform(action)
-                await self.trigger("media_change")
             } catch {
                 guard !Task.isCancelled, self.item == .media, self.isOpen else { return }
                 NSAlert(error: error).beginSheetModal(for: self.popupWindow, completionHandler: nil)
@@ -1750,6 +1927,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             let state = try await Tailscale.read()
             guard !Task.isCancelled else { return }
             tailscale = .success(state)
+            bar.publish(.tailscale(TailscaleKind(state.status)))
         } catch {
             guard !Task.isCancelled else { return }
             tailscale = .failure(error as? TailscaleError ?? .commandFailed(error.localizedDescription))
@@ -1930,8 +2108,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             do {
                 let result = try await ProcessCapture().run(Tailscale.executable(), arguments)
                 guard !Task.isCancelled else { return }
-                await self.trigger("tailscale_change")
-                guard !Task.isCancelled else { return }
+                self.bar.pollTailscale()
                 self.tailscaleCommand = nil
                 guard self.item == .tailscale, self.isOpen else { return }
                 if result.status != 0 && result.status != SIGTERM {
@@ -2178,13 +2355,17 @@ func runCLI(_ operation: @escaping () async throws -> Void) -> Never {
 }
 
 let arguments = CommandLine.arguments
-if arguments.count > 1 && arguments[1] == "audio" {
-    let data = try JSONSerialization.data(withJSONObject: Audio.snapshot(), options: [.sortedKeys])
-    print(String(decoding: data, as: UTF8.self))
-} else if arguments.count > 1 && arguments[1] == "network-state" {
-    guard let state = NetworkState.read() else { exit(1) }
-    let data = try JSONEncoder().encode(state)
-    print(String(decoding: data, as: UTF8.self))
+if arguments.count > 2 && arguments[1] == "volume-scroll" {
+    // status.sh passes SketchyBar's SCROLL_DELTA. Each notch moves the volume 2 percentage points.
+    guard let delta = Double(arguments[2]), delta.isFinite else {
+        logger.error("Invalid scroll delta: \(arguments[2], privacy: .public)")
+        exit(EXIT_FAILURE)
+    }
+    do { try Audio.change(by: 2 * Int(min(50, max(-50, delta)).rounded())) }
+    catch { logger.error("Changing the volume failed: \(error.localizedDescription, privacy: .public)"); exit(EXIT_FAILURE) }
+} else if arguments.count > 1 && arguments[1] == "mute-toggle" {
+    do { try Audio.setMuted(!Audio.muted(Audio.current)) }
+    catch { logger.error("Toggling mute failed: \(error.localizedDescription, privacy: .public)"); exit(EXIT_FAILURE) }
 } else if arguments.count > 1 && arguments[1] == "notch" {
     // notch.sh reads this. null means the bar's display has no camera housing.
     let size = Notch.main.map { ["width": Int($0.width.rounded()), "height": Int($0.height.rounded())] }
@@ -2192,23 +2373,12 @@ if arguments.count > 1 && arguments[1] == "audio" {
     print(String(decoding: data, as: UTF8.self))
 } else if arguments.count > 1 && arguments[1] == PopupCommand.hoverEnd.rawValue {
     DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": PopupCommand.hoverEnd.rawValue], deliverImmediately: true)
-} else if arguments.count > 1 && arguments[1] == "media-state" {
-    runCLI {
-        let snapshot = try await Media.read()
-        let data = try JSONEncoder().encode(snapshot)
-        print(String(decoding: data, as: UTF8.self))
-    }
 } else if arguments.count > 2 && arguments[1] == "media" {
     guard let action = MediaAction(rawValue: arguments[2]) else {
         logger.error("Unknown media command: \(arguments[2])")
         exit(EXIT_FAILURE)
     }
     runCLI { try await Media.perform(action) }
-} else if arguments.count > 1 && arguments[1] == "tailscale-state" {
-    runCLI {
-        let data = try await JSONEncoder().encode(["kind": Tailscale.kind()])
-        print(String(decoding: data, as: UTF8.self))
-    }
 } else if arguments.count > 1 && arguments[1] == PopupCommand.stop.rawValue {
     DistributedNotificationCenter.default().postNotificationName(Popups.notification, object: nil, userInfo: ["item": PopupCommand.stop.rawValue], deliverImmediately: true)
     // sketchybarrc starts a helper right after this. Wait up to 2 s for the running one to
