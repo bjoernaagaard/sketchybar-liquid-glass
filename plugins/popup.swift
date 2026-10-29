@@ -2393,20 +2393,34 @@ final class Popups: NSObject, NSApplicationDelegate {
             let total = Double(sample.memory.total)
             meter([(Double(sample.memory.app) / total, 0.92), (Double(sample.memory.wired) / total, 0.6),
                  (Double(sample.memory.compressed) / total, 0.35)], strain: sample.pressure.strain)
+            let entries = [("App", sample.memory.app, 0.92), ("Wired", sample.memory.wired, 0.6),
+                           ("Compressed", sample.memory.compressed, 0.35)] as [(String, UInt64, CGFloat)]
+            let texts = entries.map { name, bytes, _ in
+                label("\(name) \(String(format: "%.1f", Double(bytes) / gib))", x: 0, y: y, width: width, color: "TEXT2", in: view)
+            }
+            // Each entry is an 8 pt swatch, 4 pt, then its text. Wide values close the 10 pt gaps down to
+            // 6 pt, then shrink the text, so the legend never passes the right padding.
+            let swatches = CGFloat(entries.count) * 12, gaps = CGFloat(entries.count - 1)
+            var font = NSFont(name: "SF Pro Semibold", size: 11) ?? .systemFont(ofSize: 11, weight: .semibold)
+            func measure() -> CGFloat {
+                for text in texts { text.font = font; text.sizeToFit() }
+                return texts.reduce(0) { $0 + $1.frame.width }
+            }
+            var textWidth = measure()
+            let gap = min(10, max(6, (width - pad * 2 - swatches - textWidth) / gaps))
+            while textWidth > width - pad * 2 - swatches - gap * gaps && font.pointSize > 6 {
+                font = font.withSize(font.pointSize - 0.5)
+                textWidth = measure()
+            }
             var x = pad
-            let font = NSFont(name: "SF Pro Semibold", size: 11) ?? .systemFont(ofSize: 11, weight: .semibold)
-            for (name, bytes, alpha) in [("App", sample.memory.app, 0.92), ("Wired", sample.memory.wired, 0.6),
-                                         ("Compressed", sample.memory.compressed, 0.35)] as [(String, UInt64, CGFloat)] {
+            for (entry, text) in zip(entries, texts) {
                 let swatch = NSView(frame: NSRect(x: x, y: y + 3, width: 8, height: 8))
                 swatch.wantsLayer = true
                 swatch.layer?.cornerRadius = 2
-                swatch.layer?.backgroundColor = theme.color("TEXT").withAlphaComponent(alpha).cgColor
+                swatch.layer?.backgroundColor = theme.color("TEXT").withAlphaComponent(entry.2).cgColor
                 view.addSubview(swatch)
-                let text = label("\(name) \(String(format: "%.1f", Double(bytes) / gib))", x: x + 12, y: y, width: width, color: "TEXT2", in: view)
-                text.font = font
-                text.sizeToFit()
                 text.setFrameOrigin(NSPoint(x: x + 12, y: y + 7 - text.frame.height / 2))
-                x = text.frame.maxX + 10
+                x = text.frame.maxX + gap
             }
             y += legendHeight
         }
