@@ -6,10 +6,7 @@ if [ "$NAME" = media ]; then
   esac
 fi
 case "$SENDER" in
-  mouse.entered|mouse.exited)
-    # The system item is a bracket of two halves, so hovering either half lights the whole item.
-    case "$NAME" in system.*) NAME=system ;; esac
-    exec "$CONFIG_DIR/plugins/hover.sh" ;;
+  mouse.entered|mouse.exited) exec "$CONFIG_DIR/plugins/hover.sh" ;;
 esac
 source "$CONFIG_DIR/theme.sh"
 
