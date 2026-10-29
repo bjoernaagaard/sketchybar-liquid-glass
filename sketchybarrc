@@ -22,7 +22,8 @@ a+=(--add event aerospace_workspace_change
     --add event volume_state
     --add event network_state
     --add event media_state
-    --add event tailscale_state)
+    --add event tailscale_state
+    --add event system_state)
 
 gap() { a+=(--add item "$1" left --set "$1" width=$2); }
 
@@ -74,7 +75,7 @@ a+=(--add item spaces left
     --subscribe front mouse.entered mouse.exited)
 
 # right side is added right to left
-# The resident helper pushes volume, media, network, and tailscale with <item>_state events.
+# The resident helper pushes volume, media, network, tailscale, and system with <item>_state events.
 # updates=on keeps a push from being dropped while an item is not shown.
 a+=(--add item clock right
     --set clock icon.color=$TEXT2 icon.font="$FONT:Medium:13.0" icon.padding_left=8 icon.padding_right=6 label.padding_right=8
@@ -108,7 +109,20 @@ a+=(--add item clock right
     --add item tailscale right
     --set tailscale icon.padding_left=8 icon.padding_right=8 label.drawing=off updates=on script="$PLUGIN_DIR/status.sh"
                     click_script="$PLUGIN_DIR/popup.sh tailscale"
-    --subscribe tailscale tailscale_state mouse.entered mouse.exited)
+    --subscribe tailscale tailscale_state mouse.entered mouse.exited
+
+    --add item system.memory right
+    --set system.memory icon.padding_left=5 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
+                        updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh system"
+    --subscribe system.memory mouse.entered mouse.exited
+
+    --add item system.cpu right
+    --set system.cpu icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=5
+                     updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh system"
+    --subscribe system.cpu system_state mouse.entered mouse.exited
+
+    --add bracket system system.cpu system.memory
+    --set system background.color=$CLEAR background.height=22 background.corner_radius=8)
 
 $SB "${a[@]}"
 # The resident helper draws the island on a notched display and reports display changes.

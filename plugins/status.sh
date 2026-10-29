@@ -6,7 +6,10 @@ if [ "$NAME" = media ]; then
   esac
 fi
 case "$SENDER" in
-  mouse.entered|mouse.exited) exec "$CONFIG_DIR/plugins/hover.sh" ;;
+  mouse.entered|mouse.exited)
+    # The system item is a bracket of two halves, so hovering either half lights the whole item.
+    case "$NAME" in system.*) NAME=system ;; esac
+    exec "$CONFIG_DIR/plugins/hover.sh" ;;
 esac
 source "$CONFIG_DIR/theme.sh"
 
@@ -89,5 +92,17 @@ case "$NAME" in
       *)           icon=$'\xf4\x80\x87\xb8'; color=$TEXT3 ;;
     esac
     $SB "${COLOR_ANIM[@]}" --set tailscale icon="$icon" icon.color=$color
+    ;;
+
+  system.cpu)
+    # The resident helper pushes CPU and MEM percents and a level for CPU, memory, and disk.
+    [ "$SENDER" = system_state ] || exit 0
+    tint() { case "$1" in crit) c=$CRIT ;; warn) c=$WARN ;; *) c=$TEXT2 ;; esac; }
+    tint "$DISK_LEVEL"; icons=$c
+    tint "$CPU_LEVEL"; cpu=$c
+    tint "$MEM_LEVEL"; mem=$c
+    # SF Pro cpu U+100AE5 and memorychip U+100AE6, verified in SF-Pro.ttf as glyphs 21391 and 21397.
+    $SB "${COLOR_ANIM[@]}" --set system.cpu icon=$'\xf4\x80\xab\xa5' icon.color=$icons label="${CPU}%" label.color=$cpu \
+                           --set system.memory icon=$'\xf4\x80\xab\xa6' icon.color=$icons label="${MEM}%" label.color=$mem
     ;;
 esac

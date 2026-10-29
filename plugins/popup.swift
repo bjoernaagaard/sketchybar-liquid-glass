@@ -2,13 +2,14 @@
 import AppKit
 import CoreAudio
 import EventKit
+import IOKit
 import SystemConfiguration
 import os
 
 private let logger = Logger(subsystem: "com.bjoernaagaard.sketchybar", category: "popup")
 
 enum PopupKind: String {
-    case volume, clock, network, tailscale, media
+    case volume, clock, network, tailscale, media, system
 }
 
 // Commands for the running helper. Strings exist only at the shell and notification boundary.
@@ -691,7 +692,7 @@ struct Theme {
         }
         self.numbers = numbers
         var colors: [String: NSColor] = [:]
-        for name in ["TEXT", "TEXT2", "TEXT3", "BAR_COLOR", "BAR_EDGE", "ISLAND_COLOR"] {
+        for name in ["TEXT", "TEXT2", "TEXT3", "BAR_COLOR", "BAR_EDGE", "ISLAND_COLOR", "WARN", "CRIT"] {
             let raw = try required(name)
             guard raw.hasPrefix("0x"), let value = UInt32(raw.dropFirst(2), radix: 16) else { throw ConfigurationError.invalidValue(name) }
             colors[name] = NSColor(srgbRed: CGFloat((value >> 16) & 255) / 255,
@@ -1150,6 +1151,335 @@ struct CalendarEvent {
     let color: NSColor
 }
 
+// How strained a reading is. The bar and the system popup tint the same way.
+enum Strain: String {
+    case normal, warn, crit
+}
+
+enum MemoryPressure: Int32 {
+    case normal = 1, warning = 2, critical = 4
+
+    var title: String {
+        switch self {
+        case .normal: "Normal"
+        case .warning: "Warning"
+        case .critical: "Critical"
+        }
+    }
+
+    var strain: Strain {
+        switch self {
+        case .normal: .normal
+        case .warning: .warn
+        case .critical: .crit
+        }
+    }
+}
+
+// Cumulative CPU ticks since boot. The kernel counters are 32-bit and wrap, so differences wrap too.
+struct CPUTicks {
+    let user: UInt32
+    let system: UInt32
+    let idle: UInt32
+
+    // Like Activity Monitor and SketchyBar's cpu_load, nice time is left out.
+    func load(since earlier: CPUTicks) -> CPULoad {
+        let user = Double(user &- earlier.user), system = Double(system &- earlier.system)
+        let total = user + system + Double(idle &- earlier.idle)
+        return total > 0 ? CPULoad(user: user / total, system: system / total) : CPULoad(user: 0, system: 0)
+    }
+}
+
+// Fractions of the interval, from 0 to 1.
+struct CPULoad: Equatable {
+    let user: Double
+    let system: Double
+    var total: Double { user + system }
+}
+
+// Activity Monitor's Memory Used is App + Wired + Compressed.
+struct MemoryUsage: Equatable {
+    let app: UInt64
+    let wired: UInt64
+    let compressed: UInt64
+    let total: UInt64
+    var used: UInt64 { app + wired + compressed }
+}
+
+struct Capacity: Equatable {
+    let used: UInt64
+    let total: UInt64
+}
+
+struct InterfaceBytes {
+    let received: UInt32
+    let sent: UInt32
+}
+
+struct NetworkRate: Equatable {
+    let interface: String
+    let received: Double
+    let sent: Double
+}
+
+struct CoreCluster: Equatable {
+    let title: String
+    let load: Double
+}
+
+struct ProcessLoad {
+    let name: String
+    let percent: Int
+}
+
+// Unprivileged public reads. Unsafe Mach, sysctl, getifaddrs, IOKit, and libproc access stays here.
+struct SystemRead {
+    static let host = mach_host_self()
+
+    static func number<T: BitwiseCopyable>(_ name: String, _ initial: T) -> T? {
+        var value = initial
+        var size = MemoryLayout<T>.size
+        return sysctlbyname(name, &value, &size, nil, 0) == 0 && size == MemoryLayout<T>.size ? value : nil
+    }
+
+    static func text(_ name: String) -> String? {
+        var size = 0
+        guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return nil }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname(name, &buffer, &size, nil, 0) == 0 else { return nil }
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    static func cpu() -> CPUTicks? {
+        var info = host_cpu_load_info()
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info>.size / MemoryLayout<integer_t>.size)
+        let status = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { host_statistics(host, HOST_CPU_LOAD_INFO, $0, &count) }
+        }
+        guard status == KERN_SUCCESS else { return nil }
+        return CPUTicks(user: info.cpu_ticks.0, system: info.cpu_ticks.1, idle: info.cpu_ticks.2)
+    }
+
+    static func cores() -> [CPUTicks] {
+        var cpus: natural_t = 0
+        var info: processor_info_array_t?
+        var count: mach_msg_type_number_t = 0
+        guard host_processor_info(host, PROCESSOR_CPU_LOAD_INFO, &cpus, &info, &count) == KERN_SUCCESS, let info else { return [] }
+        defer { vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: info)), vm_size_t(count) * vm_size_t(MemoryLayout<integer_t>.stride)) }
+        let values = UnsafeBufferPointer(start: info, count: Int(count))
+        let stride = Int(CPU_STATE_MAX)
+        guard values.count >= Int(cpus) * stride else { return [] }
+        return (0..<Int(cpus)).map { cpu in
+            let base = cpu * stride
+            return CPUTicks(user: UInt32(bitPattern: values[base + Int(CPU_STATE_USER)]),
+                            system: UInt32(bitPattern: values[base + Int(CPU_STATE_SYSTEM)]),
+                            idle: UInt32(bitPattern: values[base + Int(CPU_STATE_IDLE)]))
+        }
+    }
+
+    // Apple silicon numbers its logical CPUs by cluster with efficiency cores first, which the
+    // device tree's cluster-type confirms. Titles and counts come from hw.perflevel*.
+    static let clusters: [(title: String, cpus: Range<Int>)] = {
+        let levels = number("hw.nperflevels", Int32(0)) ?? 0
+        guard levels > 1 else {
+            let count = Int(number("hw.logicalcpu", Int32(0)) ?? 0)
+            return [("Cores (\(count))", 0..<count)]
+        }
+        var start = 0
+        return (0..<levels).reversed().map { level in
+            let count = Int(number("hw.perflevel\(level).logicalcpu", Int32(0)) ?? 0)
+            let name = text("hw.perflevel\(level).name") ?? "Level \(level)"
+            defer { start += count }
+            return ("\(name) cores (\(count))", start..<start + count)
+        }.reversed()
+    }()
+
+    static let pageSize: UInt64 = {
+        var size: vm_size_t = 0
+        return host_page_size(host, &size) == KERN_SUCCESS ? UInt64(size) : 16384
+    }()
+
+    static func memory() -> MemoryUsage? {
+        var info = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
+        let status = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { host_statistics64(host, HOST_VM_INFO64, $0, &count) }
+        }
+        guard status == KERN_SUCCESS else { return nil }
+        let app = UInt64(info.internal_page_count) - min(UInt64(info.internal_page_count), UInt64(info.purgeable_count))
+        return MemoryUsage(app: app * pageSize, wired: UInt64(info.wire_count) * pageSize,
+                           compressed: UInt64(info.compressor_page_count) * pageSize, total: ProcessInfo.processInfo.physicalMemory)
+    }
+
+    static func pressure() -> MemoryPressure {
+        number("kern.memorystatus_vm_pressure_level", Int32(0)).flatMap(MemoryPressure.init) ?? .normal
+    }
+
+    static func swap() -> Capacity? {
+        number("vm.swapusage", xsw_usage()).map { Capacity(used: $0.xsu_used, total: $0.xsu_total) }
+    }
+
+    static func disk() -> Capacity? {
+        var stats = statfs()
+        guard statfs("/", &stats) == 0 else { return nil }
+        let block = UInt64(stats.f_bsize)
+        return Capacity(used: (stats.f_blocks - stats.f_bavail) * block, total: stats.f_blocks * block)
+    }
+
+    static func bytes(_ interface: String) -> InterfaceBytes? {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return nil }
+        defer { freeifaddrs(list) }
+        for entry in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            guard let address = entry.pointee.ifa_addr, address.pointee.sa_family == UInt8(AF_LINK),
+                  let data = entry.pointee.ifa_data, String(cString: entry.pointee.ifa_name) == interface else { continue }
+            let counters = data.load(as: if_data.self)
+            return InterfaceBytes(received: counters.ifi_ibytes, sent: counters.ifi_obytes)
+        }
+        return nil
+    }
+
+    static func bootTime() -> Date? {
+        number("kern.boottime", timeval()).map { Date(timeIntervalSince1970: Double($0.tv_sec) + Double($0.tv_usec) / 1_000_000) }
+    }
+
+    // The highest utilization any GPU reports.
+    static func gpu() -> Int? {
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(iterator) }
+        var result: Int?
+        while case let service = IOIteratorNext(iterator), service != 0 {
+            defer { IOObjectRelease(service) }
+            guard let property = IORegistryEntryCreateCFProperty(service, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0),
+                  let statistics = property.takeRetainedValue() as? [String: Any],
+                  let value = statistics["Device Utilization %"] as? Int else { continue }
+            result = max(result ?? 0, value)
+        }
+        return result
+    }
+
+    // rusage times are in Mach time units, which are not nanoseconds on Apple silicon.
+    static let nanosecondsPerTick: Double = {
+        var timebase = mach_timebase_info_data_t()
+        return mach_timebase_info(&timebase) == KERN_SUCCESS && timebase.denom > 0 ? Double(timebase.numer) / Double(timebase.denom) : 1
+    }()
+
+    // CPU time in nanoseconds for each process the user owns. Other users' processes are not readable.
+    static func processTimes() -> [pid_t: Double] {
+        let capacity = Int(proc_listallpids(nil, 0)) + 64
+        guard capacity > 64 else { return [:] }
+        var pids = [pid_t](repeating: 0, count: capacity)
+        let count = Int(proc_listallpids(&pids, Int32(capacity * MemoryLayout<pid_t>.size)))
+        guard count > 0 else { return [:] }
+        let user = getuid()
+        var times: [pid_t: Double] = [:]
+        for pid in pids.prefix(min(count, capacity)) where pid > 0 {
+            var info = proc_bsdshortinfo()
+            let size = Int32(MemoryLayout<proc_bsdshortinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDT_SHORTBSDINFO, 0, &info, size) == size, info.pbsi_uid == user else { continue }
+            var usage = rusage_info_v2()
+            let status = withUnsafeMutablePointer(to: &usage) {
+                $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V2, $0) }
+            }
+            guard status == 0 else { continue }
+            times[pid] = Double(usage.ri_user_time + usage.ri_system_time) * nanosecondsPerTick
+        }
+        return times
+    }
+
+    static func processName(_ pid: pid_t) -> String {
+        if let name = NSRunningApplication(processIdentifier: pid)?.localizedName { return name }
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXCOMLEN) + 1)
+        guard proc_name(pid, &buffer, UInt32(buffer.count)) > 0 else { return "Process \(pid)" }
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    static func now() -> UInt64 { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
+}
+
+// One reading every 2 s. The bar shows CPU and memory from it, and the open popup shows all of it.
+struct SystemSample: Equatable {
+    let time: UInt64
+    let cpu: CPULoad
+    let clusters: [CoreCluster]
+    let memory: MemoryUsage
+    let pressure: MemoryPressure
+    let swap: Capacity?
+    let disk: Capacity?
+    let network: NetworkRate?
+    let thermal: ProcessInfo.ThermalState
+    // CPU above 80 % for 5 samples in a row, which is 10 s.
+    let busy: Bool
+
+    var cpuStrain: Strain { thermal == .serious || thermal == .critical ? .crit : busy ? .warn : .normal }
+    var diskStrain: Strain { disk.map { $0.total > 0 && ($0.total - $0.used) * 10 < $0.total } == true ? .warn : .normal }
+
+    var bar: BarState {
+        .system(cpu: Int((cpu.total * 100).rounded()),
+                memory: memory.total > 0 ? Int((Double(memory.used) * 100 / Double(memory.total)).rounded()) : 0,
+                cpuStrain: cpuStrain, memoryStrain: pressure.strain, diskStrain: diskStrain)
+    }
+}
+
+// Keeps the previous counters, because CPU load and network speed are differences over time.
+struct SystemSampler {
+    private var time: UInt64 = 0
+    private var cpu: CPUTicks?
+    private var cores: [CPUTicks] = []
+    private var network: (interface: String, bytes: InterfaceBytes)?
+    private var busySamples = 0
+
+    // The first call only primes the counters.
+    mutating func sample(interface: String?) -> SystemSample? {
+        let now = SystemRead.now()
+        let ticks = SystemRead.cpu(), cores = SystemRead.cores()
+        let bytes = interface.flatMap(SystemRead.bytes)
+        defer {
+            time = now
+            cpu = ticks
+            self.cores = cores
+            if let interface, let bytes { network = (interface, bytes) } else { network = nil }
+        }
+        guard let ticks, let previous = cpu, now > time, let memory = SystemRead.memory() else { return nil }
+        let load = ticks.load(since: previous)
+        busySamples = load.total > 0.8 ? busySamples + 1 : 0
+        let clusters = cores.count == self.cores.count ? SystemRead.clusters.compactMap { cluster -> CoreCluster? in
+            let range = cluster.cpus.clamped(to: 0..<cores.count)
+            guard !range.isEmpty else { return nil }
+            let total = range.reduce(0) { $0 + cores[$1].load(since: self.cores[$1]).total }
+            return CoreCluster(title: cluster.title, load: total / Double(range.count))
+        } : []
+        var rate: NetworkRate?
+        if let interface, let bytes, let network, network.interface == interface {
+            let seconds = Double(now - time) / 1_000_000_000
+            rate = NetworkRate(interface: interface, received: Double(bytes.received &- network.bytes.received) / seconds,
+                               sent: Double(bytes.sent &- network.bytes.sent) / seconds)
+        }
+        return SystemSample(time: now, cpu: load, clusters: clusters, memory: memory, pressure: SystemRead.pressure(),
+                            swap: SystemRead.swap(), disk: SystemRead.disk(), network: rate,
+                            thermal: ProcessInfo.processInfo.thermalState, busy: busySamples >= 5)
+    }
+}
+
+// Top processes by CPU since the previous call. Read only while the system popup is open.
+struct ProcessSampler {
+    private var time: UInt64 = 0
+    private var times: [pid_t: Double] = [:]
+
+    mutating func sample(count: Int) -> [ProcessLoad]? {
+        let now = SystemRead.now()
+        let current = SystemRead.processTimes()
+        defer { time = now; times = current }
+        guard time > 0, now > time else { return nil }
+        let elapsed = Double(now - time)
+        return current.compactMap { pid, cpu in times[pid].flatMap { cpu >= $0 ? (pid, (cpu - $0) / elapsed) : nil } }
+            .sorted { $0.1 > $1.1 }
+            .prefix(count)
+            .map { ProcessLoad(name: SystemRead.processName($0.0), percent: Int(($0.1 * 100).rounded())) }
+    }
+}
+
 // What a bar item shows. Strings exist only in `variables`, at the sketchybar trigger boundary.
 enum BarState: Equatable {
     case volume(percent: Int?, muted: Bool)
@@ -1157,6 +1487,7 @@ enum BarState: Equatable {
     case media(title: String, artist: String, playing: Bool)
     case mediaUnavailable
     case tailscale(TailscaleKind)
+    case system(cpu: Int, memory: Int, cpuStrain: Strain, memoryStrain: Strain, diskStrain: Strain)
 
     // Each item subscribes to its own event in sketchybarrc, and status.sh reads the variables.
     var event: String {
@@ -1165,6 +1496,7 @@ enum BarState: Equatable {
         case .network: "network_state"
         case .media, .mediaUnavailable: "media_state"
         case .tailscale: "tailscale_state"
+        case .system: "system_state"
         }
     }
 
@@ -1175,11 +1507,14 @@ enum BarState: Equatable {
         case .media(let title, let artist, let playing): ["MEDIA=\(playing ? "playing" : "paused")", "TITLE=\(title)", "ARTIST=\(artist)"]
         case .mediaUnavailable: ["MEDIA=unavailable"]
         case .tailscale(let kind): ["KIND=\(kind.rawValue)"]
+        case .system(let cpu, let memory, let cpuStrain, let memoryStrain, let diskStrain):
+            ["CPU=\(cpu)", "MEM=\(memory)", "CPU_LEVEL=\(cpuStrain.rawValue)", "MEM_LEVEL=\(memoryStrain.rawValue)",
+             "DISK_LEVEL=\(diskStrain.rawValue)"]
         }
     }
 }
 
-// Watches volume, the output device, network, and Tailscale, and sends each change to the bar.
+// Watches volume, the output device, network, Tailscale, and system resources, and sends each change to the bar.
 // Popups feeds it media from the stream it shares with the island.
 final class BarFeed {
     private let sketchybar: URL
@@ -1191,6 +1526,10 @@ final class BarFeed {
     private var audioWatches: [(id: AudioObjectID, address: AudioObjectPropertyAddress)] = []
     private var network: (store: SCDynamicStore, source: CFRunLoopSource)?
     private var tailscale: Task<Void, Never>?
+    private var systemLoop: Task<Void, Never>?
+    private var sampler = SystemSampler()
+    private var primaryInterface: String?
+    private(set) var system: SystemSample?
 
     init(sketchybar: URL) { self.sketchybar = sketchybar }
 
@@ -1204,6 +1543,14 @@ final class BarFeed {
         audioChanged()
         networkChanged()
         pollTailscale()
+        sampleSystem()
+        systemLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, let self else { return }
+                self.sampleSystem()
+            }
+        }
     }
 
     // A restarted bar or a wake gets every value again, then fresh reads.
@@ -1217,6 +1564,8 @@ final class BarFeed {
     func stop() {
         tailscale?.cancel()
         tailscale = nil
+        systemLoop?.cancel()
+        systemLoop = nil
         pushing?.cancel()
         pushing = nil
         pending.removeAll()
@@ -1244,7 +1593,15 @@ final class BarFeed {
 
     func networkChanged() {
         guard let state = NetworkState.read() else { return }
+        primaryInterface = (state.connections.first { $0.primary } ?? state.connections.first { $0.active })?.interface
         publish(.network(state.kind))
+    }
+
+    // Pushes only when a rounded number or a strain level changes, because publish skips equal states.
+    func sampleSystem() {
+        guard let sample = sampler.sample(interface: primaryInterface) else { return }
+        system = sample
+        publish(sample.bar)
     }
 
     func pollTailscale() {
@@ -1324,6 +1681,10 @@ final class Popups: NSObject, NSApplicationDelegate {
     // One media-control stream feeds the bar item and, on a notched display, the island.
     var mediaStream: Task<Void, Never>?
     var streamedMedia: MediaSnapshot?
+    // The system popup shows the bar's latest sample and adds GPU and top processes while open.
+    var systemShown: SystemSample?
+    var processes = ProcessSampler()
+    var topProcesses: [ProcessLoad] = []
 
     init(theme: Theme) {
         self.theme = theme
@@ -1383,6 +1744,7 @@ final class Popups: NSObject, NSApplicationDelegate {
                     if self.hoverCanClose && !self.anchor.contains(pointer) && !self.popupWindow.frame.contains(pointer) { self.close() }
                 case .clock:
                     if self.calendarMinute != Int(Date().timeIntervalSince1970 / 60) || self.calendarDirty { self.loadCalendar() }
+                case .system: if self.bar.system != self.systemShown { self.refreshSystem() }
                 case nil: break
                 }
             }
@@ -1541,6 +1903,11 @@ final class Popups: NSObject, NSApplicationDelegate {
                 self.events = []
                 self.calendarError = nil
                 self.buildCalendar()
+            case .system:
+                if self.bar.system == nil { self.bar.sampleSystem() }
+                self.processes = ProcessSampler()
+                self.topProcesses = self.processes.sample(count: 3) ?? []
+                self.buildSystem()
             }
             guard !Task.isCancelled else { return }
             self.openingTask = nil
@@ -1908,6 +2275,155 @@ final class Popups: NSObject, NSApplicationDelegate {
         network.bezelStyle = .inline
         network.font = theme.font
         view.addSubview(network)
+    }
+
+    func refreshSystem() {
+        // A rebuild under a pressed button would drop its click. The next sample catches up.
+        guard NSEvent.pressedMouseButtons == 0 else { return }
+        if let top = processes.sample(count: 3) { topProcesses = top }
+        buildSystem()
+    }
+
+    func buildSystem() {
+        systemShown = bar.system
+        let sample = bar.system
+        let pad = theme.number("POPUP_PADDING")
+        let width = theme.number("POPUP_WIDTH")
+        let row = theme.number("POPUP_ROW")
+        let clusters = sample?.clusters ?? []
+        // Three process rows always, so the panel keeps its height between refreshes.
+        let rows = CGFloat(15 + clusters.count + 3)
+        let meterHeight: CGFloat = 8, legendHeight: CGFloat = 24
+        let view = surface(height: pad * 2 + row * rows + meterHeight * 2 + legendHeight)
+        var y = pad
+        func next() -> CGFloat { defer { y += row }; return y }
+        let valueFont = NSFont.monospacedDigitSystemFont(ofSize: theme.font.pointSize, weight: .semibold)
+        func line(_ title: String, _ value: String, valueColor: String = "TEXT2") {
+            let rowY = next()
+            let detail = label(value, x: 0, y: rowY, width: width, color: valueColor, in: view)
+            detail.font = valueFont
+            detail.sizeToFit()
+            detail.setFrameOrigin(NSPoint(x: width - pad - detail.frame.width, y: rowY))
+            label(title, x: pad, y: rowY, width: detail.frame.minX - pad - theme.number("POPUP_GAP"), in: view)
+        }
+        func heading(_ text: String) { label(text, x: pad, y: next(), width: width - pad * 2, color: "TEXT3", in: view) }
+        // Thin bars under the row above, in TEXT at falling opacity, or tinted under strain.
+        func meter(_ parts: [(fraction: Double, alpha: CGFloat)], strain: Strain) {
+            let track = NSView(frame: NSRect(x: pad, y: y - row + 26, width: width - pad * 2, height: 6))
+            track.wantsLayer = true
+            track.layer?.backgroundColor = theme.color("BAR_EDGE").cgColor
+            track.layer?.cornerRadius = 3
+            track.layer?.masksToBounds = true
+            let color = switch strain {
+            case .normal: theme.color("TEXT")
+            case .warn: theme.color("WARN")
+            case .crit: theme.color("CRIT")
+            }
+            var x: CGFloat = 0
+            for part in parts {
+                let segment = CALayer()
+                let length = (track.frame.width * CGFloat(min(1, max(0, part.fraction)))).rounded()
+                segment.frame = CGRect(x: x, y: 0, width: min(length, track.frame.width - x), height: 6)
+                segment.backgroundColor = color.withAlphaComponent(part.alpha).cgColor
+                track.layer?.addSublayer(segment)
+                x += segment.frame.width
+            }
+            view.addSubview(track)
+            y += meterHeight
+        }
+        func percent(_ fraction: Double) -> String { "\(Int((fraction * 100).rounded()))%" }
+        func gigabytes(_ bytes: UInt64, unit: Double) -> String {
+            let value = Double(bytes) / unit
+            return value.rounded() == value || value >= 100 ? "\(Int(value.rounded()))" : String(format: "%.1f", value)
+        }
+        let gib = Double(1 << 30)
+        func speed(_ bytes: Double) -> String {
+            bytes < 1_000_000 ? "\(Int((bytes / 1000).rounded())) KB/s" : String(format: "%.1f MB/s", bytes / 1_000_000)
+        }
+
+        let titleY = next()
+        label("System", x: pad, y: titleY, width: width - pad * 2, in: view)
+        if let boot = SystemRead.bootTime() {
+            let minutes = max(0, Int(Date().timeIntervalSince(boot) / 60))
+            let text = minutes >= 1440 ? "Up \(minutes / 1440) d \(minutes % 1440 / 60) h"
+                : minutes >= 60 ? "Up \(minutes / 60) h \(minutes % 60) min" : "Up \(minutes) min"
+            let uptime = label(text, x: pad, y: titleY, width: width - pad * 2, color: "TEXT3", in: view)
+            uptime.alignment = .right
+        }
+
+        heading("CPU")
+        line("Load", sample.map { percent($0.cpu.total) } ?? "")
+        if let sample { meter([(sample.cpu.user, 0.92), (sample.cpu.system, 0.45)], strain: sample.cpuStrain) }
+        for cluster in clusters { line(cluster.title, percent(cluster.load)) }
+
+        heading("Memory")
+        let memory = sample?.memory
+        line("Used", memory.map { "\(gigabytes($0.used, unit: gib)) of \(gigabytes($0.total, unit: gib)) GB" } ?? "")
+        if let sample, sample.memory.total > 0 {
+            let total = Double(sample.memory.total)
+            meter([(Double(sample.memory.app) / total, 0.92), (Double(sample.memory.wired) / total, 0.6),
+                 (Double(sample.memory.compressed) / total, 0.35)], strain: sample.pressure.strain)
+            var x = pad
+            let font = NSFont(name: "SF Pro Semibold", size: 11) ?? .systemFont(ofSize: 11, weight: .semibold)
+            for (name, bytes, alpha) in [("App", sample.memory.app, 0.92), ("Wired", sample.memory.wired, 0.6),
+                                         ("Compressed", sample.memory.compressed, 0.35)] as [(String, UInt64, CGFloat)] {
+                let swatch = NSView(frame: NSRect(x: x, y: y + 3, width: 8, height: 8))
+                swatch.wantsLayer = true
+                swatch.layer?.cornerRadius = 2
+                swatch.layer?.backgroundColor = theme.color("TEXT").withAlphaComponent(alpha).cgColor
+                view.addSubview(swatch)
+                let text = label("\(name) \(String(format: "%.1f", Double(bytes) / gib))", x: x + 12, y: y, width: width, color: "TEXT2", in: view)
+                text.font = font
+                text.sizeToFit()
+                text.setFrameOrigin(NSPoint(x: x + 12, y: y + 7 - text.frame.height / 2))
+                x = text.frame.maxX + 10
+            }
+            y += legendHeight
+        }
+        line("Pressure", sample?.pressure.title ?? "")
+        line("Swap", sample?.swap.map { "\(gigabytes($0.used, unit: gib)) of \(gigabytes($0.total, unit: gib)) GB" } ?? "")
+
+        heading("Storage and network")
+        let volume = (try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeNameKey]))?.volumeName ?? "Startup disk"
+        line(volume, sample?.disk.map { "\(gigabytes($0.total - $0.used, unit: 1e9)) GB free" } ?? "")
+        // U+2193 and U+2191 were checked against /Library/Fonts/SF-Pro.ttf (glyphs 31651 and 31629).
+        if let network = sample?.network {
+            line(network.interface, "↓ \(speed(network.received))  ↑ \(speed(network.sent))")
+        } else {
+            line("Network", "Not connected", valueColor: "TEXT3")
+        }
+
+        heading("Graphics and heat")
+        line("GPU", SystemRead.gpu().map { "\($0)%" } ?? "Unavailable")
+        let thermal = switch sample?.thermal {
+        case .nominal: "Nominal"
+        case .fair: "Fair"
+        case .serious: "Serious"
+        case .critical: "Critical"
+        case nil: ""
+        @unknown default: "Unknown"
+        }
+        line("Thermal state", thermal)
+
+        heading("Top processes")
+        for index in 0..<3 {
+            if index < topProcesses.count { line(topProcesses[index].name, "\(topProcesses[index].percent)%") } else { y += row }
+        }
+
+        let monitor = NSButton(title: "Activity Monitor…", target: self, action: #selector(openActivityMonitor))
+        monitor.frame = NSRect(x: pad, y: next(), width: width - pad * 2, height: row)
+        monitor.bezelStyle = .inline
+        monitor.font = theme.font
+        view.addSubview(monitor)
+    }
+
+    @objc func openActivityMonitor() {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.ActivityMonitor") else {
+            logger.error("Activity Monitor is not installed.")
+            return
+        }
+        NSWorkspace.shared.open(url)
+        close()
     }
 
     func openSettings(_ address: String) {

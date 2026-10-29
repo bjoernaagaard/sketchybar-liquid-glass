@@ -11,6 +11,9 @@ CLEAR=0x00ffffff
 BAR_COLOR=0xe61e2023
 BAR_EDGE=0x1fffffff
 ISLAND_COLOR=0xff000000
+# Apple's dark-mode system yellow and red, for readings under strain.
+WARN=0xffffd60a
+CRIT=0xffff453a
 
 SIZE_ANIM=(--animate tanh 12)
 COLOR_ANIM=(--animate tanh 10)
