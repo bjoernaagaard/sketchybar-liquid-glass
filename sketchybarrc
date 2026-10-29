@@ -3,8 +3,10 @@
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/sketchybar}"
 source "$CONFIG_DIR/theme.sh"
 PLUGIN_DIR="$CONFIG_DIR/plugins"
-# hover.sh records which system half is under the pointer. A restart can miss the last exit.
+# hover.sh records which system half is under the pointer, and spaces.sh marks a running retry chain.
+# A restart can leave either behind.
 rm -f "${TMPDIR:-/tmp}"/sketchybar-hover.system.*
+rmdir "${TMPDIR:-/tmp}/sketchybar-spaces-retry" 2>/dev/null
 "$PLUGIN_DIR/popup.sh" build || exit 1
 
 # notch.sh switches to BAR_NOTCH when the main display has a camera housing.

@@ -8,10 +8,15 @@ windows=$(aerospace list-windows --all --format '%{workspace}|%{app-bundle-id}')
 IFS='|' read -r front_id front_name < <(aerospace list-windows --focused --format '%{app-bundle-id}|%{app-name}' 2>/dev/null)
 workspaces=$(aerospace list-workspaces --all 2>/dev/null)
 
-# AeroSpace may send no event when it starts after the bar, so ask again every 2 s for up to a minute.
+# AeroSpace may send no event when it starts after the bar, so one chain asks again every 2 s
+# for up to a minute. The directory marks a running chain, so other events don't start more.
+pending="${TMPDIR:-/tmp}/sketchybar-spaces-retry"
 retry=${SPACES_RETRY:-0}
-if [ -z "$workspaces" ] && [ "$retry" -lt 30 ]; then
-  (sleep 2; $SB --trigger aerospace_focus_change SPACES_RETRY=$((retry + 1))) &
+if [ -n "$workspaces" ]; then
+  rmdir "$pending" 2>/dev/null
+elif [ -n "${SPACES_RETRY:-}" ] || mkdir "$pending" 2>/dev/null; then
+  if [ "$retry" -lt 30 ]; then (sleep 2; $SB --trigger aerospace_focus_change SPACES_RETRY=$((retry + 1))) &
+  else rmdir "$pending" 2>/dev/null; fi
 fi
 
 # The bar does not wait for AeroSpace. The first snapshot after it answers builds any missing pill,
@@ -28,11 +33,16 @@ for ws in $workspaces; do
   members=("ws.$ws")
   for ((i = 0; i < MAX_APPS; i++)); do members+=("ws.$ws.a$i"); done
   members+=("ws.$ws.end")
+  # Only the first pill goes without a 2 pt gap before it, whichever workspace is first now.
   gap=()
-  [ ${#order[@]} = 0 ] || gap=("ws.$ws.gap")
+  if [ ${#order[@]} = 0 ]; then
+    [[ $bar == *"\"ws.$ws.gap\""* ]] && add+=(--remove "ws.$ws.gap")
+  else
+    gap=("ws.$ws.gap")
+    [[ $bar == *"\"ws.$ws.gap\""* ]] || add+=(--add item "$gap" left --set "$gap" width=2)
+  fi
   order+=("${gap[@]}" "${members[@]}" "ws.$ws.pill")
   [[ $bar == *"\"ws.$ws\""* ]] && continue
-  [ ${#gap[@]} = 0 ] || add+=(--add item "$gap" left --set "$gap" width=2)
   add+=(--add item "ws.$ws" left
         --set "ws.$ws" label="$ws" label.color=$TEXT3 label.padding_left=8 label.padding_right=8
                        background.drawing=off click_script="aerospace workspace $ws")
