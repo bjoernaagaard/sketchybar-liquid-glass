@@ -821,7 +821,8 @@ struct Theme {
         var numbers: [String: CGFloat] = [:]
         for name in ["POPUP_RADIUS", "POPUP_WIDTH_VOLUME", "POPUP_WIDTH_CLOCK", "POPUP_WIDTH_NETWORK", "POPUP_WIDTH_TAILSCALE",
                      "POPUP_WIDTH_MEDIA", "POPUP_WIDTH_SYSTEM", "POPUP_WIDTH_FRONT", "POPUP_WIDTH_INFORMATION",
-                     "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE", "ISLAND_GAP", "PROGRESS_INSET"] {
+                     "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE", "ISLAND_GAP", "ISLAND_RADIUS", "MERGE_DISTANCE",
+                     "PROGRESS_INSET"] {
             guard let value = Double(try required(name)), value.isFinite, value >= 0 else { throw ConfigurationError.invalidValue(name) }
             numbers[name] = CGFloat(value)
         }
@@ -903,6 +904,14 @@ struct ItemQuery: Decodable {
         guard let rect = boundingRects["display-\(index)"], rect.origin.count == 2, rect.size.count == 2,
               rect.size[0] > 0 else { return nil }
         return (rect.origin[0], rect.size[0])
+    }
+
+    // The rectangle in AppKit screen coordinates, whose origin is the bottom left of the screen.
+    func frame(display index: Int, on screen: NSScreen) -> NSRect? {
+        guard let rect = boundingRects["display-\(index)"], rect.origin.count == 2, rect.size.count == 2,
+              rect.size[0] > 0, rect.size[1] > 0 else { return nil }
+        return NSRect(x: screen.frame.minX + rect.origin[0], y: screen.frame.maxY - rect.origin[1] - rect.size[1],
+                      width: rect.size[0], height: rect.size[1])
     }
 }
 
@@ -995,6 +1004,72 @@ struct Notch: Equatable {
 
     // SketchyBar's display=main is CGMainDisplayID, which AppKit lists first.
     static var main: Notch? { NSScreen.screens.first.flatMap(Notch.init(screen:)) }
+}
+
+// The three pills of the bar. Each raw value is the SketchyBar bracket that holds the pill's items.
+enum Island: String, CaseIterable {
+    case left = "half.left", media = "island.media", right = "half.right"
+}
+
+// The glass behind the islands: one borderless window on the bar's display, one level below SketchyBar's
+// item windows, which sit at kCGFloatingWindowLevel because sketchybarrc sets topmost=window. The window
+// ignores the mouse, so SketchyBar keeps every click and hover. Each drop follows its bracket's bounds.
+final class GlassLayer {
+    // The bar strip: y_offset 8, height 30, and the 8 pt margin below, as sketchybarrc sets them.
+    private static let stripHeight: CGFloat = 46
+    private let window = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+    private let drops: [Island: NSGlassEffectView]
+
+    init(theme: Theme) {
+        let canvas = NSView()
+        let container = NSGlassEffectContainerView()
+        container.spacing = theme.number("MERGE_DISTANCE")
+        container.contentView = canvas
+        var drops: [Island: NSGlassEffectView] = [:]
+        for island in Island.allCases {
+            let drop = NSGlassEffectView()
+            drop.style = .regular
+            drop.cornerRadius = theme.number("ISLAND_RADIUS")
+            drop.tintColor = theme.color("BAR_COLOR")
+            drop.isHidden = true
+            canvas.addSubview(drop)
+            drops[island] = drop
+        }
+        self.drops = drops
+        window.contentView = container
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.floatingWindow)) - 1)
+        window.ignoresMouseEvents = true
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        window.hidesOnDeactivate = false
+        window.isReleasedWhenClosed = false
+        window.appearance = NSAppearance(named: .darkAqua)
+        moveToBarScreen()
+    }
+
+    // SketchyBar's display=main is the first screen AppKit lists (see Notch.main).
+    func moveToBarScreen() {
+        guard let screen = NSScreen.screens.first else { return }
+        window.setFrame(NSRect(x: screen.frame.minX, y: screen.frame.maxY - Self.stripHeight,
+                               width: screen.frame.width, height: Self.stripHeight), display: false)
+    }
+
+    func show() { window.orderFrontRegardless() }
+
+    // Frames are in AppKit screen coordinates. An island without a frame keeps its last one.
+    func place(_ frames: [Island: NSRect]) {
+        for (island, frame) in frames {
+            guard let drop = drops[island] else { continue }
+            drop.frame = frame.offsetBy(dx: -window.frame.minX, dy: -window.frame.minY)
+            drop.isHidden = false
+            let placed = window.convertToScreen(drop.convert(drop.bounds, to: nil))
+            interactionLogger.debug("event=glass_place island=\(island.rawValue, privacy: .public) drop=\(NSStringFromRect(placed), privacy: .public) bracket=\(NSStringFromRect(frame), privacy: .public)")
+        }
+    }
+
+    func close() { window.close() }
 }
 
 final class FlippedView: NSView {
@@ -1360,7 +1435,6 @@ enum BarState: Equatable {
     case mediaProgress(Int)
     case tailscale(TailscaleKind)
     case system(cpu: Int, memory: Int, cpuStrain: Strain, memoryStrain: Strain, diskStrain: Strain)
-    case appearance(reduceTransparency: Bool, increaseContrast: Bool)
 
     // Each item subscribes to its own event in sketchybarrc, and status.sh reads the variables.
     var event: String {
@@ -1371,7 +1445,6 @@ enum BarState: Equatable {
         case .mediaProgress: "media_progress"
         case .tailscale: "tailscale_state"
         case .system: "system_state"
-        case .appearance: "appearance_state"
         }
     }
 
@@ -1386,8 +1459,6 @@ enum BarState: Equatable {
         case .system(let cpu, let memory, let cpuStrain, let memoryStrain, let diskStrain):
             ["CPU=\(cpu)", "MEM=\(memory)", "CPU_LEVEL=\(cpuStrain.rawValue)", "MEM_LEVEL=\(memoryStrain.rawValue)",
              "DISK_LEVEL=\(diskStrain.rawValue)"]
-        case .appearance(let reduceTransparency, let increaseContrast):
-            ["TRANSPARENCY=\(reduceTransparency ? "reduced" : "normal")", "CONTRAST=\(increaseContrast ? "high" : "normal")"]
         }
     }
 }
@@ -1418,7 +1489,6 @@ final class BarFeed {
         let device = Audio.address(kAudioHardwarePropertyDefaultOutputDevice)
         if Audio.listen(Audio.system, device, listener) { audioWatches.append((Audio.system, device)) }
         network = NetworkState.watch(self)
-        appearanceChanged()
         audioChanged()
         networkChanged()
         pollTailscale()
@@ -1435,7 +1505,6 @@ final class BarFeed {
     // A restarted bar or a wake gets every value again, then fresh reads.
     func pushAll() {
         for state in pushed.values { publish(state, force: true) }
-        appearanceChanged()
         audioChanged()
         networkChanged()
         pollTailscale()
@@ -1469,13 +1538,6 @@ final class BarFeed {
             }
             self?.pushing = nil
         }
-    }
-
-    // The pills follow Reduce Transparency and Increase Contrast. System glass popups follow them on their own.
-    func appearanceChanged() {
-        let workspace = NSWorkspace.shared
-        publish(.appearance(reduceTransparency: workspace.accessibilityDisplayShouldReduceTransparency,
-                            increaseContrast: workspace.accessibilityDisplayShouldIncreaseContrast))
     }
 
     func networkChanged() {
@@ -1570,6 +1632,9 @@ final class Popups: NSObject, NSApplicationDelegate {
     var tailscaleCommand: Task<Void, Never>?
     var tailscaleLogin = false
     let bar: BarFeed
+    // The islands' glass, and the one task that reads the brackets to place it. A new read replaces a pending one.
+    let glass: GlassLayer
+    var islandsTask: Task<Void, Never>?
     // One media-control stream feeds the bar item and the media popup.
     var mediaStream: Task<Void, Never>?
     var streamedMedia: MediaSnapshot?
@@ -1587,6 +1652,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     init(theme: Theme) {
         self.theme = theme
         bar = BarFeed(sketchybar: URL(fileURLWithPath: theme.sketchybarPath))
+        glass = GlassLayer(theme: theme)
         super.init()
     }
 
@@ -1596,6 +1662,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        glass.show()
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
@@ -1639,7 +1706,6 @@ final class Popups: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.willSleepNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(woke), name: NSWorkspace.didWakeNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displayOptionsChanged), name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(calendarChanged), name: .EKEventStoreChanged, object: nil)
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
@@ -1665,6 +1731,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
         bar.start()
+        refreshIslands()
         startMediaStream()
         switch initialCommand {
         case .toggle(let source): show(source)
@@ -1682,12 +1749,10 @@ final class Popups: NSObject, NSApplicationDelegate {
         catch { logger.error("Changing the volume failed: \(error.localizedDescription, privacy: .public)") }
     }
 
-    // NSWorkspace posts this on the main thread, like the sleep and wake notifications above.
-    @objc func displayOptionsChanged() { bar.appearanceChanged() }
-
     @objc func woke() {
         bar.pushAll()
         fitMedia(after: .milliseconds(350))
+        refreshIslands(after: .milliseconds(350))
     }
 
     func startMediaStream() {
@@ -1770,6 +1835,32 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
     }
 
+    // Reads the three brackets at once and places the glass on their bounds. A bracket that cannot be read
+    // keeps its glass where it is.
+    func refreshIslands(after delay: Duration = .zero) {
+        islandsTask?.cancel()
+        islandsTask = Task { [weak self] in
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            guard !Task.isCancelled, let frames = await self?.queryIslands(), !Task.isCancelled else { return }
+            self?.glass.place(frames)
+        }
+    }
+
+    func queryIslands() async -> [Island: NSRect]? {
+        guard let screen = NSScreen.screens.first else { return nil }
+        async let displayIndex = barDisplayIndex()
+        async let left = queryItem(Island.left.rawValue)
+        async let media = queryItem(Island.media.rawValue)
+        async let right = queryItem(Island.right.rawValue)
+        let queries: [(Island, ItemQuery?)] = await [(.left, left), (.media, media), (.right, right)]
+        guard !Task.isCancelled, let index = await displayIndex else { return nil }
+        var frames: [Island: NSRect] = [:]
+        for (island, query) in queries {
+            if let frame = query?.frame(display: index, on: screen) { frames[island] = frame }
+        }
+        return frames.isEmpty ? nil : frames
+    }
+
     func queryItem(_ name: String) async -> ItemQuery? {
         guard let result = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath), ["--query", name]),
               !Task.isCancelled, result.status == 0 else { return nil }
@@ -1804,8 +1895,10 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     @objc func screensChanged() {
         close()
+        glass.moveToBarScreen()
         // notch.sh sets the notch width for the new display, which moves the media island.
         fitMedia(after: .milliseconds(350))
+        refreshIslands(after: .milliseconds(350))
         notchTask?.cancel()
         notchTask = Task { [weak self] in await self?.trigger("notch_change") }
     }
@@ -1825,6 +1918,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         notchTask = nil
         mediaFitTask?.cancel()
         mediaFitTask = nil
+        islandsTask?.cancel()
+        islandsTask = nil
+        glass.close()
         mediaProgressLoop?.cancel()
         mediaProgressLoop = nil
         mediaStream?.cancel()
@@ -1861,6 +1957,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         case .start:
             bar.pushAll()
             fitMedia()
+            refreshIslands()
         case .toggle(let source): show(source)
         case .media(let action): performMedia(action)
         }
@@ -1878,6 +1975,7 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     func geometryChanged() {
+        refreshIslands()
         // status.sh calls this after every update, and spaces.sh again once its size animation settles
         // (about 0.2 s), so the fit waits for the last call.
         fitMedia(after: .milliseconds(350))

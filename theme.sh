@@ -10,11 +10,10 @@ HOVER=0x12ffffff
 # The media progress plate: white at low opacity, so it reads as glass and not as a hue.
 PROGRESS=0x14ffffff
 CLEAR=0x00ffffff
+# The tint of the island glass and the popup track. The system draws the glass solid under Reduce Transparency
+# and with a stronger edge under Increase Contrast.
 BAR_COLOR=0xe61e2023
 BAR_EDGE=0x1fffffff
-# Reduce Transparency makes the pills opaque. Increase Contrast makes their edge stronger.
-BAR_SOLID=0xff1e2023
-BAR_EDGE_STRONG=0x66ffffff
 # Apple's dark-mode system yellow and red, for readings under strain.
 WARN=0xffffd60a
 CRIT=0xffff453a
@@ -37,10 +36,11 @@ PILL_END=6       # last icon to pill edge: 2 + 6 = 8 pt, the same as pill edge t
 MAX_APPS=4
 
 # The bar is clear and holds three pills: half.left, island.media, and half.right. The *.start and *.end
-# items supply the 4 pt inner padding.
+# items supply the 4 pt inner padding. The brackets keep their bounds and draw nothing: the helper's GlassLayer
+# draws the glass at those bounds.
+ISLAND_RADIUS=12
 BAR_NOTCH=(color=$CLEAR border_width=0)
-PILL_STYLE=(background.color=$BAR_COLOR background.border_color=$BAR_EDGE background.border_width=1
-            background.corner_radius=12 background.height=30)
+PILL_STYLE=(background.color=$CLEAR background.border_width=0 background.corner_radius=$ISLAND_RADIUS background.height=30)
 
 # A fixed cell for the volume label, so "100%" fits and the media island's fit stays stable. An explicit
 # width ignores padding: "100%" in SF Pro Medium 13 measures 35.4 pt, plus the 8 pt label.padding_right.
@@ -49,8 +49,10 @@ VOLUME_LABEL_WIDTH=44
 CPU_LABEL_WIDTH=41      # 35.4 pt plus the 5 pt label.padding_right
 MEMORY_LABEL_WIDTH=44   # 35.4 pt plus the 8 pt label.padding_right
 
-# The media island ends this far from the left island and from the notch.
-ISLAND_GAP=5
+# The media island starts this far from the left island. It equals POPUP_GAP and MERGE_DISTANCE: the glass
+# starts to pull shapes together at MERGE_DISTANCE, so rest gaps of that size sit just outside the pull.
+ISLAND_GAP=8
+MERGE_DISTANCE=8
 
 # The media controls are fixed cells, so the fit stays stable. The widest glyph (backward.fill and forward.fill,
 # SF Pro Medium 13) advances 19.1 pt.
@@ -62,7 +64,7 @@ PROGRESS_INSET=2
 PROGRESS_HEIGHT=26
 PROGRESS_RADIUS=10
 
-# Native popups draw on system glass (NSGlassEffectView) with no size animation. The bar itself stays without blur.
+# Native popups draw on system glass (NSGlassEffectView) with no size animation, like the islands.
 # Each width is the widest fixed row in SF Pro Semibold 13 plus POPUP_PADDING * 2. Text of any length (track titles,
 # device names, event titles) truncates, so a width only keeps the common case whole. Bash 3.2 has no associative
 # arrays, so each kind has its own variable. Battery, workspace and mode share INFORMATION.
