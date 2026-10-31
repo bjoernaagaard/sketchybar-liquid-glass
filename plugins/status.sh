@@ -47,20 +47,18 @@ case "$NAME" in
     ;;
 
   media)
-    # The resident helper pushes MEDIA, TITLE, and ARTIST from its media-control stream.
+    # The resident helper pushes MEDIA, LABEL, and WIDTH. It fits the label to the media item, and the
+    # item to the gap between the left island and the notch.
     [ "$SENDER" = media_state ] || exit 0
     if [ "$MEDIA" = unavailable ]; then
       # SF Pro music.note U+10046A, verified in SF-Pro.ttf as glyph 15101.
-      $SB --set media icon=$'\xf4\x80\x91\xaa' icon.color=$TEXT3 label="Media unavailable"
-      exit 0
-    fi
-    if [ -z "$TITLE" ]; then label="Not playing"
-    elif [ -z "$ARTIST" ]; then label=$TITLE
-    else label="$TITLE · $ARTIST"; fi
+      icon=$'\xf4\x80\x91\xaa'; color=$TEXT3
     # SF Pro pause.fill U+100286 and play.fill U+100284, verified in SF-Pro.ttf.
-    if [ "$MEDIA" = playing ]; then icon=$'\xf4\x80\x8a\x86'; color=$TEXT
+    elif [ "$MEDIA" = playing ]; then icon=$'\xf4\x80\x8a\x86'; color=$TEXT
     else icon=$'\xf4\x80\x8a\x84'; color=$TEXT2; fi
-    $SB "${COLOR_ANIM[@]}" --set media icon="$icon" icon.color=$color label="$label"
+    honor_reduce_motion
+    $SB "${COLOR_ANIM[@]}" --set media icon="$icon" icon.color=$color
+    $SB "${SIZE_ANIM[@]}" --set media width="$WIDTH" label="$LABEL"
     ;;
 
   network)

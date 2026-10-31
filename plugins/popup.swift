@@ -802,7 +802,7 @@ struct Theme {
         guard let pid = Int32(try required("POPUP_BAR_PID")), pid > 0 else { throw ConfigurationError.invalidValue("POPUP_BAR_PID") }
         barPID = pid
         var numbers: [String: CGFloat] = [:]
-        for name in ["POPUP_RADIUS", "POPUP_WIDTH", "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE"] {
+        for name in ["POPUP_RADIUS", "POPUP_WIDTH", "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE", "ISLAND_GAP"] {
             guard let value = Double(try required(name)), value.isFinite, value >= 0 else { throw ConfigurationError.invalidValue(name) }
             numbers[name] = CGFloat(value)
         }
@@ -830,6 +830,8 @@ struct Theme {
     }
 
     var font: NSFont { NSFont(name: "SF Pro Semibold", size: 13) ?? .systemFont(ofSize: 13, weight: .semibold) }
+    // The bar's icon font, which measures the media glyph.
+    var iconFont: NSFont { NSFont(name: "SF Pro Medium", size: 13) ?? .systemFont(ofSize: 13, weight: .medium) }
 }
 
 final class PopupPanel: NSPanel {
@@ -849,6 +851,99 @@ final class Surface: NSView {
                                xRadius: theme.number("POPUP_RADIUS"), yRadius: theme.number("POPUP_RADIUS"))
         theme.color("BAR_COLOR").setFill(); path.fill()
         theme.color("BAR_EDGE").setStroke(); path.lineWidth = 1; path.stroke()
+    }
+}
+
+// One item as `sketchybar --query <item>` reports it.
+struct ItemQuery: Decodable {
+    struct Text: Decodable {
+        let value: String
+        let paddingLeft: Double
+        let paddingRight: Double
+
+        enum CodingKeys: String, CodingKey {
+            case value, paddingLeft = "padding_left", paddingRight = "padding_right"
+        }
+    }
+
+    struct Bounds: Decodable {
+        let origin: [Double]
+        let size: [Double]
+    }
+
+    let icon: Text?
+    let label: Text?
+    let boundingRects: [String: Bounds]
+
+    enum CodingKeys: String, CodingKey {
+        case icon, label, boundingRects = "bounding_rects"
+    }
+
+    // SketchyBar measures from the top left of the display. Only x and the width matter here.
+    func bounds(display index: Int) -> (minX: Double, width: Double)? {
+        guard let rect = boundingRects["display-\(index)"], rect.origin.count == 2, rect.size.count == 2,
+              rect.size[0] > 0 else { return nil }
+        return (rect.origin[0], rect.size[0])
+    }
+}
+
+// What the media item shows, before it is fitted to the island.
+enum MediaDisplay: Equatable {
+    case unavailable
+    case track(title: String, artist: String, playing: Bool)
+
+    init(_ snapshot: MediaSnapshot?) {
+        self = .track(title: snapshot?.title ?? "", artist: snapshot?.artist ?? "", playing: snapshot?.playing ?? false)
+    }
+
+    var text: String {
+        switch self {
+        case .unavailable: "Media unavailable"
+        case .track(let title, let artist, _): title.isEmpty ? "Not playing" : artist.isEmpty ? title : "\(title) · \(artist)"
+        }
+    }
+
+    func state(_ fit: MediaFit) -> BarState {
+        switch self {
+        case .unavailable: .mediaUnavailable(label: fit.label, width: fit.width)
+        case .track(_, _, let playing): .media(label: fit.label, width: fit.width, playing: playing)
+        }
+    }
+}
+
+// Measured positions, in points. None of them depends on the media item's own width: SketchyBar
+// keeps q positions in unsigned integers, so an item wider than the space left of the notch wraps
+// to the far end of the bar, and a fit based on its position could never shrink it back.
+struct MediaLayout {
+    let leftEdge: Double       // half.left right edge
+    let rightEdge: Double      // where the media item must end: notch.gap, less the island's end padding and volume
+    let startWidth: Double     // island.media.start, the island's padding before the media item
+    let reserved: Double       // icon padding, glyph, and label padding: what the title cannot use
+}
+
+// The media item's width and title. The island's right edge is pinned by SketchyBar, so the item
+// fills the space from the left island plus the gap, and the title shortens to fit.
+struct MediaFit: Equatable {
+    let width: Int
+    let label: String
+
+    init(text: String, layout: MediaLayout, gap: Double, font: NSFont) {
+        let fitted = layout.rightEdge - (layout.leftEdge + gap + layout.startWidth)
+        width = max(Int(layout.reserved.rounded(.up)), Int(fitted.rounded(.down)))
+        let available = Double(width) - layout.reserved
+        func measure(_ string: String) -> Double { Double((string as NSString).size(withAttributes: [.font: font]).width.rounded(.up)) }
+        guard measure(text) > available else { label = text; return }
+        // Largest prefix whose width, with an ellipsis, fits. Width grows with the prefix.
+        let characters = Array(text)
+        func candidate(_ count: Int) -> String {
+            String(characters.prefix(count)).trimmingCharacters(in: .whitespaces) + "…"
+        }
+        var low = 0, high = characters.count - 1
+        while low < high {
+            let middle = (low + high + 1) / 2
+            if measure(candidate(middle)) <= available { low = middle } else { high = middle - 1 }
+        }
+        label = measure(candidate(low)) <= available ? candidate(low) : ""
     }
 }
 
@@ -1237,8 +1332,8 @@ struct ProcessSampler {
 enum BarState: Equatable {
     case volume(percent: Int?, muted: Bool)
     case network(NetworkKind)
-    case media(title: String, artist: String, playing: Bool)
-    case mediaUnavailable
+    case media(label: String, width: Int, playing: Bool)
+    case mediaUnavailable(label: String, width: Int)
     case tailscale(TailscaleKind)
     case system(cpu: Int, memory: Int, cpuStrain: Strain, memoryStrain: Strain, diskStrain: Strain)
 
@@ -1257,8 +1352,8 @@ enum BarState: Equatable {
         switch self {
         case .volume(let percent, let muted): ["VOLUME=\(percent.map(String.init) ?? "fixed")", "MUTED=\(muted)"]
         case .network(let kind): ["KIND=\(kind.rawValue)"]
-        case .media(let title, let artist, let playing): ["MEDIA=\(playing ? "playing" : "paused")", "TITLE=\(title)", "ARTIST=\(artist)"]
-        case .mediaUnavailable: ["MEDIA=unavailable"]
+        case .media(let label, let width, let playing): ["MEDIA=\(playing ? "playing" : "paused")", "LABEL=\(label)", "WIDTH=\(width)"]
+        case .mediaUnavailable(let label, let width): ["MEDIA=unavailable", "LABEL=\(label)", "WIDTH=\(width)"]
         case .tailscale(let kind): ["KIND=\(kind.rawValue)"]
         case .system(let cpu, let memory, let cpuStrain, let memoryStrain, let diskStrain):
             ["CPU=\(cpu)", "MEM=\(memory)", "CPU_LEVEL=\(cpuStrain.rawValue)", "MEM_LEVEL=\(memoryStrain.rawValue)",
@@ -1439,6 +1534,9 @@ final class Popups: NSObject, NSApplicationDelegate {
     // One media-control stream feeds the bar item and the media popup.
     var mediaStream: Task<Void, Never>?
     var streamedMedia: MediaSnapshot?
+    // What the bar item shows, and the one task that fits it. A new fit replaces a pending one.
+    var mediaDisplay: MediaDisplay?
+    var mediaFitTask: Task<Void, Never>?
     // The system popup shows the bar's latest sample and adds GPU and top processes while open.
     var systemShown: SystemSample?
     var processes = ProcessSampler()
@@ -1540,7 +1638,10 @@ final class Popups: NSObject, NSApplicationDelegate {
         catch { logger.error("Changing the volume failed: \(error.localizedDescription, privacy: .public)") }
     }
 
-    @objc func woke() { bar.pushAll() }
+    @objc func woke() {
+        bar.pushAll()
+        fitMedia(after: .milliseconds(350))
+    }
 
     func startMediaStream() {
         guard mediaStream == nil else { return }
@@ -1556,11 +1657,11 @@ final class Popups: NSObject, NSApplicationDelegate {
                     return
                 } catch MediaError.missingCLI {
                     logger.error("The media stream needs media-control on PATH.")
-                    self?.bar.publish(.mediaUnavailable)
+                    self?.showMedia(.unavailable)
                     return
                 } catch {
                     logger.error("The media stream failed: \(error.localizedDescription, privacy: .private)")
-                    self?.bar.publish(.mediaUnavailable)
+                    self?.showMedia(.unavailable)
                 }
                 // The stream ends when media-control or its system service restarts.
                 try? await Task.sleep(for: .seconds(5))
@@ -1570,12 +1671,61 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func streamed(_ snapshot: MediaSnapshot?) {
         streamedMedia = snapshot
-        bar.publish(.media(title: snapshot?.title ?? "", artist: snapshot?.artist ?? "", playing: snapshot?.playing ?? false))
+        showMedia(MediaDisplay(snapshot))
+    }
+
+    func showMedia(_ display: MediaDisplay) {
+        mediaDisplay = display
+        fitMedia()
+    }
+
+    // Measures the gap between the left island and the media island, then pushes the width and title that
+    // fill it. `publish` skips a state the bar already has, so a refit that changes nothing ends here and
+    // the geometry call that status.sh makes after the push does not loop.
+    func fitMedia(after delay: Duration = .zero) {
+        mediaFitTask?.cancel()
+        mediaFitTask = Task { [weak self] in
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            guard !Task.isCancelled, let layout = await self?.mediaLayout(), !Task.isCancelled, let self,
+                  let display = self.mediaDisplay else { return }
+            let fit = MediaFit(text: display.text, layout: layout, gap: Double(self.theme.number("ISLAND_GAP")), font: self.theme.font)
+            self.bar.publish(display.state(fit))
+        }
+    }
+
+    func queryItem(_ name: String) async -> ItemQuery? {
+        guard let result = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath), ["--query", name]),
+              !Task.isCancelled, result.status == 0 else { return nil }
+        return try? JSONDecoder().decode(ItemQuery.self, from: result.output)
+    }
+
+    func mediaLayout() async -> MediaLayout? {
+        guard let index = await barDisplayIndex(),
+              let left = await queryItem("half.left"), let volume = await queryItem("volume"),
+              let start = await queryItem("island.media.start"), let media = await queryItem("media"),
+              !Task.isCancelled,
+              let leftBounds = left.bounds(display: index), let volumeBounds = volume.bounds(display: index),
+              let startBounds = start.bounds(display: index), let icon = media.icon, let label = media.label else { return nil }
+        // q items fill leftward from the notch: notch.gap, island.media.end, volume, then media. So volume's
+        // left edge is where media must end, whatever media's width is now.
+        let glyph = (icon.value as NSString).size(withAttributes: [.font: theme.iconFont]).width.rounded(.up)
+        return MediaLayout(leftEdge: leftBounds.minX + leftBounds.width, rightEdge: volumeBounds.minX, startWidth: startBounds.width,
+                           reserved: icon.paddingLeft + Double(glyph) + icon.paddingRight + label.paddingLeft + label.paddingRight)
+    }
+
+    // SketchyBar's arrangement index of the main display, which names the key in `bounding_rects`.
+    func barDisplayIndex() async -> Int? {
+        guard let displays = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath), ["--query", "displays"]),
+              !Task.isCancelled, displays.status == 0,
+              let objects = try? JSONSerialization.jsonObject(with: displays.output) as? [[String: Any]],
+              let display = objects.first(where: { ($0["DirectDisplayID"] as? NSNumber)?.uint32Value == CGMainDisplayID() }) else { return nil }
+        return display["arrangement-id"] as? Int
     }
 
     @objc func screensChanged() {
         close()
-        // notch.sh sets the notch width for the new display.
+        // notch.sh sets the notch width for the new display, which moves the media island.
+        fitMedia(after: .milliseconds(350))
         notchTask?.cancel()
         notchTask = Task { [weak self] in await self?.trigger("notch_change") }
     }
@@ -1593,6 +1743,8 @@ final class Popups: NSObject, NSApplicationDelegate {
         tailscaleCommand = nil
         notchTask?.cancel()
         notchTask = nil
+        mediaFitTask?.cancel()
+        mediaFitTask = nil
         mediaStream?.cancel()
         mediaStream = nil
         bar.stop()
@@ -1624,7 +1776,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         case .hoverEnd(let source):
             if lifecycle.target?.source.identity == source.identity { pointerMoved() }
             else if case .dismissed(let identity, _) = lifecycle, identity == source.identity { pointerMoved() }
-        case .start: bar.pushAll()
+        case .start:
+            bar.pushAll()
+            fitMedia()
         case .toggle(let source): show(source)
         }
     }
@@ -1641,6 +1795,9 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     func geometryChanged() {
+        // status.sh calls this after every update, and spaces.sh again once its size animation settles
+        // (about 0.2 s), so the fit waits for the last call.
+        fitMedia(after: .milliseconds(350))
         geometryGeneration += 1
         geometryTask?.cancel()
         geometryTask = nil
@@ -1674,11 +1831,7 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func queryAnchor(_ source: PopupSource) async -> NSRect? {
         let executable = URL(fileURLWithPath: theme.sketchybarPath)
-        guard let displays = try? await ProcessCapture().run(executable, ["--query", "displays"]),
-              !Task.isCancelled, displays.status == 0,
-              let objects = try? JSONSerialization.jsonObject(with: displays.output) as? [[String: Any]],
-              let display = objects.first(where: { ($0["DirectDisplayID"] as? NSNumber)?.uint32Value == CGMainDisplayID() }),
-              let index = display["arrangement-id"] as? Int, let screen = NSScreen.screens.first else { return nil }
+        guard let index = await barDisplayIndex(), let screen = NSScreen.screens.first else { return nil }
         let names: [String]
         switch source {
         case .system, .cpu, .memory: names = ["system.cpu", "system.memory"]

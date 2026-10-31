@@ -37,6 +37,13 @@ BAR_NOTCH=(color=$CLEAR border_width=0)
 PILL_STYLE=(background.color=$BAR_COLOR background.border_color=$BAR_EDGE background.border_width=1
             background.corner_radius=12 background.height=30)
 
+# A fixed cell for the volume label, so "100%" fits and the media island's fit stays stable. An explicit
+# width ignores padding: "100%" in SF Pro Medium 13 measures 35.4 pt, plus the 8 pt label.padding_right.
+VOLUME_LABEL_WIDTH=44
+
+# The media island ends this far from the left island and from the notch.
+ISLAND_GAP=5
+
 # Native popups share the bar material without blur or size animation.
 POPUP_RADIUS=12
 POPUP_WIDTH=280
