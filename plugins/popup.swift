@@ -1360,6 +1360,7 @@ enum BarState: Equatable {
     case mediaProgress(Int)
     case tailscale(TailscaleKind)
     case system(cpu: Int, memory: Int, cpuStrain: Strain, memoryStrain: Strain, diskStrain: Strain)
+    case appearance(reduceTransparency: Bool, increaseContrast: Bool)
 
     // Each item subscribes to its own event in sketchybarrc, and status.sh reads the variables.
     var event: String {
@@ -1370,6 +1371,7 @@ enum BarState: Equatable {
         case .mediaProgress: "media_progress"
         case .tailscale: "tailscale_state"
         case .system: "system_state"
+        case .appearance: "appearance_state"
         }
     }
 
@@ -1384,6 +1386,8 @@ enum BarState: Equatable {
         case .system(let cpu, let memory, let cpuStrain, let memoryStrain, let diskStrain):
             ["CPU=\(cpu)", "MEM=\(memory)", "CPU_LEVEL=\(cpuStrain.rawValue)", "MEM_LEVEL=\(memoryStrain.rawValue)",
              "DISK_LEVEL=\(diskStrain.rawValue)"]
+        case .appearance(let reduceTransparency, let increaseContrast):
+            ["TRANSPARENCY=\(reduceTransparency ? "reduced" : "normal")", "CONTRAST=\(increaseContrast ? "high" : "normal")"]
         }
     }
 }
@@ -1414,6 +1418,7 @@ final class BarFeed {
         let device = Audio.address(kAudioHardwarePropertyDefaultOutputDevice)
         if Audio.listen(Audio.system, device, listener) { audioWatches.append((Audio.system, device)) }
         network = NetworkState.watch(self)
+        appearanceChanged()
         audioChanged()
         networkChanged()
         pollTailscale()
@@ -1430,6 +1435,7 @@ final class BarFeed {
     // A restarted bar or a wake gets every value again, then fresh reads.
     func pushAll() {
         for state in pushed.values { publish(state, force: true) }
+        appearanceChanged()
         audioChanged()
         networkChanged()
         pollTailscale()
@@ -1463,6 +1469,13 @@ final class BarFeed {
             }
             self?.pushing = nil
         }
+    }
+
+    // The pills follow Reduce Transparency and Increase Contrast. System glass popups follow them on their own.
+    func appearanceChanged() {
+        let workspace = NSWorkspace.shared
+        publish(.appearance(reduceTransparency: workspace.accessibilityDisplayShouldReduceTransparency,
+                            increaseContrast: workspace.accessibilityDisplayShouldIncreaseContrast))
     }
 
     func networkChanged() {
@@ -1626,6 +1639,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.willSleepNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(woke), name: NSWorkspace.didWakeNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displayOptionsChanged), name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(calendarChanged), name: .EKEventStoreChanged, object: nil)
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
@@ -1667,6 +1681,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         do { try Audio.change(by: 2 * notches) }
         catch { logger.error("Changing the volume failed: \(error.localizedDescription, privacy: .public)") }
     }
+
+    // NSWorkspace posts this on the main thread, like the sleep and wake notifications above.
+    @objc func displayOptionsChanged() { bar.appearanceChanged() }
 
     @objc func woke() {
         bar.pushAll()

@@ -12,6 +12,9 @@ PROGRESS=0x14ffffff
 CLEAR=0x00ffffff
 BAR_COLOR=0xe61e2023
 BAR_EDGE=0x1fffffff
+# Reduce Transparency makes the pills opaque. Increase Contrast makes their edge stronger.
+BAR_SOLID=0xff1e2023
+BAR_EDGE_STRONG=0x66ffffff
 # Apple's dark-mode system yellow and red, for readings under strain.
 WARN=0xffffd60a
 CRIT=0xffff453a

@@ -30,7 +30,8 @@ a+=(--add event aerospace_workspace_change
     --add event media_state
     --add event media_progress
     --add event tailscale_state
-    --add event system_state)
+    --add event system_state
+    --add event appearance_state)
 
 gap() { a+=(--add item "$1" left --set "$1" width=$2); }
 
@@ -93,7 +94,7 @@ a+=(--add item half.right.end right
 
     --add item notch center
     --set notch drawing=off updates=on script="$PLUGIN_DIR/notch.sh"
-    --subscribe notch notch_change system_woke
+    --subscribe notch notch_change system_woke appearance_state
 
     --add item network right
     --set network icon.padding_left=8 icon.padding_right=8 label.drawing=off updates=on script="$PLUGIN_DIR/status.sh"
