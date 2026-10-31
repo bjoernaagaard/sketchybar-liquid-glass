@@ -99,6 +99,7 @@ enum PopupLifecycle {
 // Commands for the running helper. Strings exist only at the shell and notification boundary.
 enum PopupCommand {
     case toggle(PopupSource), hover(PopupSource), hoverEnd(PopupSource), geometry, start, stop, volumeScroll(notches: Int)
+    case media(MediaAction)
 
     init?(_ raw: String, argument: String? = nil) {
         switch raw {
@@ -113,6 +114,7 @@ enum PopupCommand {
         case "start": self = .start
         case "stop": self = .stop
         default:
+            if let action = MediaAction(command: raw) { self = .media(action); return }
             guard let popup = PopupSource(rawValue: raw) else { return nil }
             self = .toggle(popup)
         }
@@ -127,6 +129,7 @@ enum PopupCommand {
         case .start: "start"
         case .stop: "stop"
         case .volumeScroll: "volume-scroll"
+        case .media(let action): action.command
         }
     }
 
@@ -134,7 +137,7 @@ enum PopupCommand {
         switch self {
         case .volumeScroll(let notches): ["item": rawValue, "argument": String(notches)]
         case .hover(let source), .hoverEnd(let source): ["item": rawValue, "argument": source.rawValue]
-        case .toggle, .geometry, .start, .stop: ["item": rawValue]
+        case .toggle, .geometry, .start, .stop, .media: ["item": rawValue]
         }
     }
 
@@ -290,8 +293,22 @@ enum MediaError: LocalizedError {
     }
 }
 
-enum MediaAction: String {
+enum MediaAction: String, CaseIterable {
     case playPause = "play-pause", next, previous
+
+    // The bar controls call popup.sh with these names. They cross the shell boundary only here.
+    var command: String {
+        switch self {
+        case .playPause: "media-toggle"
+        case .next: "media-next"
+        case .previous: "media-previous"
+        }
+    }
+
+    init?(command: String) {
+        guard let action = Self.allCases.first(where: { $0.command == command }) else { return nil }
+        self = action
+    }
 
     var argument: String {
         switch self {
@@ -802,14 +819,15 @@ struct Theme {
         guard let pid = Int32(try required("POPUP_BAR_PID")), pid > 0 else { throw ConfigurationError.invalidValue("POPUP_BAR_PID") }
         barPID = pid
         var numbers: [String: CGFloat] = [:]
-        for name in ["POPUP_RADIUS", "POPUP_WIDTH", "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE",
-                     "ISLAND_WING", "ISLAND_RADIUS", "ISLAND_RESPONSE"] {
+        for name in ["POPUP_RADIUS", "POPUP_WIDTH_VOLUME", "POPUP_WIDTH_CLOCK", "POPUP_WIDTH_NETWORK", "POPUP_WIDTH_TAILSCALE",
+                     "POPUP_WIDTH_MEDIA", "POPUP_WIDTH_SYSTEM", "POPUP_WIDTH_FRONT", "POPUP_WIDTH_INFORMATION",
+                     "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE", "ISLAND_GAP", "PROGRESS_INSET"] {
             guard let value = Double(try required(name)), value.isFinite, value >= 0 else { throw ConfigurationError.invalidValue(name) }
             numbers[name] = CGFloat(value)
         }
         self.numbers = numbers
         var colors: [String: NSColor] = [:]
-        for name in ["TEXT", "TEXT2", "TEXT3", "BAR_COLOR", "BAR_EDGE", "ISLAND_COLOR", "WARN", "CRIT"] {
+        for name in ["TEXT", "TEXT2", "TEXT3", "BAR_COLOR", "BAR_EDGE", "WARN", "CRIT"] {
             let raw = try required(name)
             guard raw.hasPrefix("0x"), let value = UInt32(raw.dropFirst(2), radix: 16) else { throw ConfigurationError.invalidValue(name) }
             colors[name] = NSColor(srgbRed: CGFloat((value >> 16) & 255) / 255,
@@ -825,12 +843,28 @@ struct Theme {
         return value
     }
 
+    // Each width is measured from the popup's fixed rows (theme.sh). A new kind must choose one here.
+    func width(for kind: PopupKind) -> CGFloat {
+        switch kind {
+        case .volume: number("POPUP_WIDTH_VOLUME")
+        case .clock: number("POPUP_WIDTH_CLOCK")
+        case .network: number("POPUP_WIDTH_NETWORK")
+        case .tailscale: number("POPUP_WIDTH_TAILSCALE")
+        case .media: number("POPUP_WIDTH_MEDIA")
+        case .system: number("POPUP_WIDTH_SYSTEM")
+        case .front: number("POPUP_WIDTH_FRONT")
+        case .battery, .workspace, .mode: number("POPUP_WIDTH_INFORMATION")
+        }
+    }
+
     func color(_ name: String) -> NSColor {
         guard let value = colors[name] else { preconditionFailure("Unknown color key: \(name)") }
         return value
     }
 
     var font: NSFont { NSFont(name: "SF Pro Semibold", size: 13) ?? .systemFont(ofSize: 13, weight: .semibold) }
+    // The bar's icon font, which measures the media glyph.
+    var iconFont: NSFont { NSFont(name: "SF Pro Medium", size: 13) ?? .systemFont(ofSize: 13, weight: .medium) }
 }
 
 final class PopupPanel: NSPanel {
@@ -839,17 +873,100 @@ final class PopupPanel: NSPanel {
     override func cancelOperation(_ sender: Any?) { orderOut(nil) }
 }
 
-final class Surface: NSView {
-    let theme: Theme
-    init(frame: NSRect, theme: Theme) { self.theme = theme; super.init(frame: frame) }
-    required init?(coder: NSCoder) { fatalError("Surface is constructed in code, not decoded from an archive.") }
-    override var isFlipped: Bool { true }
-    override func draw(_ dirtyRect: NSRect) {
-        guard enclosingScrollView == nil else { return }
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                               xRadius: theme.number("POPUP_RADIUS"), yRadius: theme.number("POPUP_RADIUS"))
-        theme.color("BAR_COLOR").setFill(); path.fill()
-        theme.color("BAR_EDGE").setStroke(); path.lineWidth = 1; path.stroke()
+// One item as `sketchybar --query <item>` reports it.
+struct ItemQuery: Decodable {
+    struct Text: Decodable {
+        let value: String
+        let paddingLeft: Double
+        let paddingRight: Double
+
+        enum CodingKeys: String, CodingKey {
+            case value, paddingLeft = "padding_left", paddingRight = "padding_right"
+        }
+    }
+
+    struct Bounds: Decodable {
+        let origin: [Double]
+        let size: [Double]
+    }
+
+    let icon: Text?
+    let label: Text?
+    let boundingRects: [String: Bounds]
+
+    enum CodingKeys: String, CodingKey {
+        case icon, label, boundingRects = "bounding_rects"
+    }
+
+    // SketchyBar measures from the top left of the display. Only x and the width matter here.
+    func bounds(display index: Int) -> (minX: Double, width: Double)? {
+        guard let rect = boundingRects["display-\(index)"], rect.origin.count == 2, rect.size.count == 2,
+              rect.size[0] > 0 else { return nil }
+        return (rect.origin[0], rect.size[0])
+    }
+}
+
+// What the media item shows, before it is fitted to the island.
+enum MediaDisplay: Equatable {
+    case unavailable
+    case track(title: String, artist: String, playing: Bool)
+
+    init(_ snapshot: MediaSnapshot?) {
+        self = .track(title: snapshot?.title ?? "", artist: snapshot?.artist ?? "", playing: snapshot?.playing ?? false)
+    }
+
+    var text: String {
+        switch self {
+        case .unavailable: "Media unavailable"
+        case .track(let title, let artist, _): title.isEmpty ? "Not playing" : artist.isEmpty ? title : "\(title) · \(artist)"
+        }
+    }
+
+    func state(_ fit: MediaFit) -> BarState {
+        switch self {
+        case .unavailable: .mediaUnavailable(label: fit.label, width: fit.width)
+        case .track(_, _, let playing): .media(label: fit.label, width: fit.width, playing: playing)
+        }
+    }
+}
+
+// Measured positions, in points. None of them depends on the media item's own width: SketchyBar
+// keeps q positions in unsigned integers, so an item wider than the space left of the notch wraps
+// to the far end of the bar, and a fit based on its position could never shrink it back.
+struct MediaLayout {
+    let leftEdge: Double       // half.left right edge
+    let rightEdge: Double      // where the media item must end: the left edge of media.prev, the control nearest it
+    let islandEnd: Double      // island.media.end right edge, which SketchyBar pins at notch.gap
+    let startWidth: Double     // island.media.start, the island's padding before the media item
+    let reserved: Double       // icon padding, glyph, and label padding: what the title cannot use
+
+    // The island runs from the gap after the left island to its pinned end, once the fit has settled.
+    func islandWidth(gap: Double) -> Double { islandEnd - (leftEdge + gap) }
+}
+
+// The media item's width and title. The island's right edge is pinned by SketchyBar, so the item
+// fills the space from the left island plus the gap, and the title shortens to fit.
+struct MediaFit: Equatable {
+    let width: Int
+    let label: String
+
+    init(text: String, layout: MediaLayout, gap: Double, font: NSFont) {
+        let fitted = layout.rightEdge - (layout.leftEdge + gap + layout.startWidth)
+        width = max(Int(layout.reserved.rounded(.up)), Int(fitted.rounded(.down)))
+        let available = Double(width) - layout.reserved
+        func measure(_ string: String) -> Double { Double((string as NSString).size(withAttributes: [.font: font]).width.rounded(.up)) }
+        guard measure(text) > available else { label = text; return }
+        // Largest prefix whose width, with an ellipsis, fits. Width grows with the prefix.
+        let characters = Array(text)
+        func candidate(_ count: Int) -> String {
+            String(characters.prefix(count)).trimmingCharacters(in: .whitespaces) + "…"
+        }
+        var low = 0, high = characters.count - 1
+        while low < high {
+            let middle = (low + high + 1) / 2
+            if measure(candidate(middle)) <= available { low = middle } else { high = middle - 1 }
+        }
+        label = measure(candidate(low)) <= available ? candidate(low) : ""
     }
 }
 
@@ -880,375 +997,8 @@ struct Notch: Equatable {
     static var main: Notch? { NSScreen.screens.first.flatMap(Notch.init(screen:)) }
 }
 
-// A critically damped spring. A new target keeps the current value and velocity,
-// so a shrinking island can grow again without a jump.
-struct Spring {
-    var value: CGFloat
-    var velocity: CGFloat = 0
-    var target: CGFloat
-
-    init(_ value: CGFloat) { self.value = value; target = value }
-
-    mutating func step(_ seconds: CGFloat, response: CGFloat) {
-        guard response > 0 else { settle(); return }
-        let omega = 2 * .pi / response
-        let offset = value - target
-        let rate = velocity + omega * offset
-        let decay = exp(-omega * seconds)
-        value = target + (offset + rate * seconds) * decay
-        velocity = (rate - omega * (offset + rate * seconds)) * decay
-    }
-
-    mutating func settle() { value = target; velocity = 0 }
-
-    var settled: Bool { abs(value - target) < 0.25 && abs(velocity) < 2 }
-}
-
-final class IslandPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { false }
-}
-
 final class FlippedView: NSView {
     override var isFlipped: Bool { true }
-}
-
-// The island's black shape hangs from the top edge of the screen between the bar's two pills:
-// concave fillets where it leaves the edge, then round corners.
-final class IslandView: NSView {
-    var stripHeight: CGFloat = 0
-    // Artwork and meter beside the notch. Other subviews hang below the strip.
-    let wings = NSView()
-    let fillet: CGFloat
-    let radius: CGFloat
-
-    init(color: NSColor, fillet: CGFloat, radius: CGFloat) {
-        self.fillet = fillet
-        self.radius = radius
-        super.init(frame: .zero)
-        wantsLayer = true
-        shape.fillColor = color.cgColor
-        addSubview(wings)
-    }
-    required init?(coder: NSCoder) { fatalError("IslandView is constructed in code, not decoded from an archive.") }
-
-    private var shape: CAShapeLayer {
-        guard let layer = layer as? CAShapeLayer else { preconditionFailure("makeBackingLayer returns a CAShapeLayer.") }
-        return layer
-    }
-
-    override func makeBackingLayer() -> CALayer { CAShapeLayer() }
-
-    override func setFrameSize(_ size: NSSize) {
-        super.setFrameSize(size)
-        arrange()
-    }
-
-    // Subviews stay centered on the notch and keep their distance from the top edge.
-    func arrange() {
-        let size = bounds.size
-        for view in subviews {
-            let top = view === wings ? 0 : stripHeight
-            view.setFrameOrigin(NSPoint(x: ((size.width - view.frame.width) / 2).rounded(), y: size.height - top - view.frame.height))
-        }
-        let path = CGMutablePath()
-        let width = size.width, height = size.height
-        let curve = min(fillet, height / 2)
-        let corner = max(0, min(radius, height - curve, (width - fillet * 2) / 2))
-        path.move(to: CGPoint(x: 0, y: height))
-        path.addLine(to: CGPoint(x: width, y: height))
-        path.addQuadCurve(to: CGPoint(x: width - fillet, y: height - curve), control: CGPoint(x: width - fillet, y: height))
-        path.addArc(tangent1End: CGPoint(x: width - fillet, y: 0), tangent2End: CGPoint(x: fillet, y: 0), radius: corner)
-        path.addArc(tangent1End: CGPoint(x: fillet, y: 0), tangent2End: CGPoint(x: fillet, y: height), radius: corner)
-        path.addLine(to: CGPoint(x: fillet, y: height - curve))
-        path.addQuadCurve(to: CGPoint(x: 0, y: height), control: CGPoint(x: fillet, y: height))
-        path.closeSubpath()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        shape.path = path
-        CATransaction.commit()
-    }
-}
-
-// Four bars beside the notch that move while media plays, like the island's waveform on iPhone.
-final class LevelMeter: NSView {
-    static let size = NSSize(width: 16, height: 12)
-    private var bars: [CALayer] = []
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        wantsLayer = true
-        for index in 0..<4 {
-            let bar = CALayer()
-            bar.frame = CGRect(x: CGFloat(index) * 4.5, y: 0, width: 2.5, height: Self.size.height)
-            bar.cornerRadius = 1.25
-            layer?.addSublayer(bar)
-            bars.append(bar)
-        }
-    }
-    required init?(coder: NSCoder) { fatalError("LevelMeter is constructed in code, not decoded from an archive.") }
-
-    func update(playing: Bool, color: NSColor) {
-        let moving = playing && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        for (index, bar) in bars.enumerated() {
-            bar.backgroundColor = (playing ? color : color.withAlphaComponent(0.4)).cgColor
-            if moving {
-                guard bar.animation(forKey: "level") == nil else { continue }
-                bar.transform = CATransform3DIdentity
-                let level = CABasicAnimation(keyPath: "transform.scale.y")
-                level.fromValue = 0.3
-                level.toValue = 1
-                level.duration = [0.42, 0.56, 0.36, 0.5][index]
-                level.timeOffset = Double(index) * 0.17
-                level.autoreverses = true
-                level.repeatCount = .infinity
-                level.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                bar.add(level, forKey: "level")
-            } else {
-                bar.removeAnimation(forKey: "level")
-                bar.transform = CATransform3DMakeScale(1, playing ? 0.6 : 0.3, 1)
-            }
-        }
-    }
-}
-
-// On a notched display the camera housing is the media surface. While a player has a track,
-// wings beside the notch show its artwork and a level meter. Hovering grows the same black
-// shape down into the media popup, and closing shrinks it back. Without media it hides
-// behind the notch. Popups owns the island and decides what it shows when open.
-final class Island: NSObject {
-    private enum Shape { case hidden, compact, expanded }
-
-    let theme: Theme
-    unowned let popups: Popups
-    let panel = IslandPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-    private let view: IslandView
-    private var wings: NSView { view.wings }
-    private let artwork = NSView()
-    private let meter = LevelMeter(frame: NSRect(origin: .zero, size: LevelMeter.size))
-    private var content: NSView?
-    private(set) var notch: Notch?
-    private(set) var media: MediaSnapshot?
-    private var accent: NSColor
-    private var shape = Shape.hidden
-    private var width = Spring(0)
-    private var height = Spring(0)
-    private var link: CADisplayLink?
-    private var lastStep: CFTimeInterval?
-
-    init(theme: Theme, popups: Popups) {
-        self.theme = theme
-        self.popups = popups
-        accent = theme.color("TEXT")
-        view = IslandView(color: theme.color("ISLAND_COLOR"), fillet: theme.number("POPUP_GAP"), radius: theme.number("ISLAND_RADIUS"))
-        super.init()
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = false
-        // Above the bar and normal windows, below the bar popups.
-        panel.level = .statusBar
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-        panel.hidesOnDeactivate = false
-        panel.isReleasedWhenClosed = false
-        panel.appearance = NSAppearance(named: .darkAqua)
-        panel.title = PopupKind.media.rawValue
-        panel.contentView = view
-        artwork.wantsLayer = true
-        artwork.layer?.cornerRadius = 5
-        artwork.layer?.masksToBounds = true
-        wings.addSubview(artwork)
-        wings.addSubview(meter)
-        wings.alphaValue = 0
-        view.setAccessibilityElement(true)
-        view.setAccessibilityRole(.group)
-        view.setAccessibilityLabel("Now Playing")
-        view.addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
-    }
-
-    var isExpanded: Bool { shape == .expanded }
-
-    // Called at launch and whenever the displays change. Returns whether the bar layout must follow.
-    @discardableResult func updateNotch() -> Bool {
-        let next = Notch.main
-        guard next != notch else { return false }
-        notch = next
-        guard let next else {
-            media = nil
-            stopLink()
-            shape = .hidden
-            content?.removeFromSuperview()
-            content = nil
-            panel.orderOut(nil)
-            return true
-        }
-        view.stripHeight = next.height
-        let wing = theme.number("ISLAND_WING")
-        let art = min(22, next.height - 10)
-        wings.frame.size = NSSize(width: next.width + wing * 2, height: next.height)
-        artwork.frame = NSRect(x: ((wing - art) / 2).rounded(), y: ((next.height - art) / 2).rounded(), width: art, height: art)
-        meter.setFrameOrigin(NSPoint(x: (wings.frame.width - wing + (wing - LevelMeter.size.width) / 2).rounded(),
-                                     y: ((next.height - LevelMeter.size.height) / 2).rounded()))
-        view.arrange()
-        let size = size(shape)
-        width = Spring(size.width)
-        height = Spring(size.height)
-        render()
-        return true
-    }
-
-    func stop() {
-        stopLink()
-    }
-
-    // Returns the view the media popup lays out in, below the notch.
-    func expand(height: CGFloat) -> NSView {
-        content?.removeFromSuperview()
-        let view = FlippedView(frame: NSRect(x: 0, y: 0, width: theme.number("POPUP_WIDTH"), height: height))
-        content = view
-        self.view.addSubview(view)
-        move(to: .expanded)
-        // Lays out the new content and carries over the fade of the content it replaced.
-        self.view.arrange()
-        render()
-        return view
-    }
-
-    func collapse() {
-        // The island stays on screen, so ordering it out and back in hands the keyboard back
-        // to the frontmost app the way closing a bar popup does.
-        if panel.isKeyWindow {
-            panel.orderOut(nil)
-            panel.orderFrontRegardless()
-        }
-        move(to: media == nil ? .hidden : .compact)
-    }
-
-    func apply(_ snapshot: MediaSnapshot?) {
-        let next = snapshot?.title.isEmpty == false ? snapshot : nil
-        if next?.artworkData != media?.artworkData || artwork.layer?.contents == nil {
-            let image = next?.artworkData.flatMap(NSImage.init(data:))
-            let placeholder = NSImage(systemSymbolName: "music.note", accessibilityDescription: nil)?
-                .withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [theme.color("TEXT2")]))
-            // Fill the square like the iPhone island, so video thumbnails crop instead of letterboxing.
-            artwork.layer?.contentsGravity = image == nil ? .resizeAspect : .resizeAspectFill
-            artwork.layer?.contentsScale = panel.backingScaleFactor
-            artwork.layer?.contents = image ?? placeholder
-            accent = image.flatMap(Self.accent) ?? theme.color("TEXT")
-        }
-        media = next
-        meter.update(playing: next?.playing == true, color: accent)
-        view.setAccessibilityValue(next.map { [$0.title, $0.artist].filter { !$0.isEmpty }.joined(separator: ", ") })
-        if shape != .expanded { collapse() }
-    }
-
-    // The artwork's average color, brightened so the meter reads on black like the iPhone waveform.
-    private static func accent(_ image: NSImage) -> NSColor? {
-        guard let pixel = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 1, bitsPerSample: 8, samplesPerPixel: 4,
-                                           hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 4, bitsPerPixel: 32),
-              let context = NSGraphicsContext(bitmapImageRep: pixel) else { return nil }
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = context
-        image.draw(in: NSRect(x: 0, y: 0, width: 1, height: 1))
-        NSGraphicsContext.restoreGraphicsState()
-        guard let color = pixel.colorAt(x: 0, y: 0)?.usingColorSpace(.deviceRGB), color.saturationComponent > 0.15 else { return nil }
-        return NSColor(hue: color.hueComponent, saturation: min(1, color.saturationComponent * 1.2),
-                       brightness: max(0.8, color.brightnessComponent), alpha: 1)
-    }
-
-    private func size(_ shape: Shape) -> NSSize {
-        guard let notch else { return .zero }
-        let fillet = theme.number("POPUP_GAP")
-        let compact = notch.width + theme.number("ISLAND_WING") * 2
-        switch shape {
-        case .hidden: return NSSize(width: notch.width + fillet * 2, height: notch.height)
-        case .compact: return NSSize(width: compact + fillet * 2, height: notch.height)
-        case .expanded:
-            return NSSize(width: max(compact, theme.number("POPUP_WIDTH")) + fillet * 2, height: notch.height + (content?.frame.height ?? 0))
-        }
-    }
-
-    private func move(to next: Shape) {
-        guard notch != nil else { return }
-        shape = next
-        if !panel.isVisible {
-            guard next != .hidden else { return }
-            let start = size(.hidden)
-            width = Spring(start.width)
-            height = Spring(start.height)
-            render()
-            panel.orderFrontRegardless()
-        }
-        let target = size(next)
-        width.target = target.width
-        height.target = target.height
-        if link == nil && width.settled && height.settled {
-            finish()
-            return
-        }
-        // Reduce Motion: the shape jumps and only the contents cross-fade.
-        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            width.settle()
-            height.settle()
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.2
-                render(fading: true)
-            }
-            finish()
-            return
-        }
-        guard link == nil else { return }
-        lastStep = nil
-        let link = view.displayLink(target: self, selector: #selector(step(_:)))
-        link.add(to: .main, forMode: .common)
-        self.link = link
-    }
-
-    // The link runs on RunLoop.main, so AppKit calls this on the main actor.
-    @objc private func step(_ link: CADisplayLink) {
-        let seconds = lastStep.map { min(1 / 30, max(0, link.timestamp - $0)) } ?? 1 / 120
-        lastStep = link.timestamp
-        let response = theme.number("ISLAND_RESPONSE")
-        width.step(seconds, response: response)
-        height.step(seconds, response: response)
-        if width.settled && height.settled {
-            width.settle()
-            height.settle()
-            stopLink()
-            render()
-            finish()
-        } else {
-            render()
-        }
-    }
-
-    private func stopLink() {
-        link?.invalidate()
-        link = nil
-    }
-
-    private func finish() {
-        if shape == .hidden { panel.orderOut(nil) }
-        if shape != .expanded {
-            content?.removeFromSuperview()
-            content = nil
-        }
-    }
-
-    // Opacity follows the geometry, so an interrupted move never leaves contents out of step.
-    private func render(fading: Bool = false) {
-        guard let notch else { return }
-        panel.setFrame(NSRect(x: notch.midX - width.value / 2, y: notch.top - height.value, width: width.value, height: height.value), display: true)
-        let hidden = size(.hidden).width, compact = size(.compact).width
-        let open = content.map { min(1, max(0, (height.value - notch.height) / max(1, $0.frame.height))) } ?? 0
-        let grown = min(1, max(0, (width.value - hidden) / max(1, compact - hidden)))
-        (fading ? wings.animator() : wings).alphaValue = grown * max(0, 1 - open * 2)
-        if let content { (fading ? content.animator() : content).alphaValue = max(0, open * 2 - 1) }
-    }
-
-    // The tracking area's owner is not a responder, so name the selectors AppKit sends.
-    @objc(mouseEntered:) func mouseEntered(with event: NSEvent) { popups.show(.media) }
-
-    @objc(mouseExited:) func mouseExited(with event: NSEvent) { popups.islandExited() }
 }
 
 final class OutputButton: NSButton {
@@ -1605,10 +1355,12 @@ struct ProcessSampler {
 enum BarState: Equatable {
     case volume(percent: Int?, muted: Bool)
     case network(NetworkKind)
-    case media(title: String, artist: String, playing: Bool)
-    case mediaUnavailable
+    case media(label: String, width: Int, playing: Bool)
+    case mediaUnavailable(label: String, width: Int)
+    case mediaProgress(Int)
     case tailscale(TailscaleKind)
     case system(cpu: Int, memory: Int, cpuStrain: Strain, memoryStrain: Strain, diskStrain: Strain)
+    case appearance(reduceTransparency: Bool, increaseContrast: Bool)
 
     // Each item subscribes to its own event in sketchybarrc, and status.sh reads the variables.
     var event: String {
@@ -1616,8 +1368,10 @@ enum BarState: Equatable {
         case .volume: "volume_state"
         case .network: "network_state"
         case .media, .mediaUnavailable: "media_state"
+        case .mediaProgress: "media_progress"
         case .tailscale: "tailscale_state"
         case .system: "system_state"
+        case .appearance: "appearance_state"
         }
     }
 
@@ -1625,18 +1379,21 @@ enum BarState: Equatable {
         switch self {
         case .volume(let percent, let muted): ["VOLUME=\(percent.map(String.init) ?? "fixed")", "MUTED=\(muted)"]
         case .network(let kind): ["KIND=\(kind.rawValue)"]
-        case .media(let title, let artist, let playing): ["MEDIA=\(playing ? "playing" : "paused")", "TITLE=\(title)", "ARTIST=\(artist)"]
-        case .mediaUnavailable: ["MEDIA=unavailable"]
+        case .media(let label, let width, let playing): ["MEDIA=\(playing ? "playing" : "paused")", "LABEL=\(label)", "WIDTH=\(width)"]
+        case .mediaUnavailable(let label, let width): ["MEDIA=unavailable", "LABEL=\(label)", "WIDTH=\(width)"]
+        case .mediaProgress(let width): ["WIDTH=\(width)"]
         case .tailscale(let kind): ["KIND=\(kind.rawValue)"]
         case .system(let cpu, let memory, let cpuStrain, let memoryStrain, let diskStrain):
             ["CPU=\(cpu)", "MEM=\(memory)", "CPU_LEVEL=\(cpuStrain.rawValue)", "MEM_LEVEL=\(memoryStrain.rawValue)",
              "DISK_LEVEL=\(diskStrain.rawValue)"]
+        case .appearance(let reduceTransparency, let increaseContrast):
+            ["TRANSPARENCY=\(reduceTransparency ? "reduced" : "normal")", "CONTRAST=\(increaseContrast ? "high" : "normal")"]
         }
     }
 }
 
 // Watches volume, the output device, network, Tailscale, and system resources, and sends each change to the bar.
-// Popups feeds it media from the stream it shares with the island.
+// Popups feeds it media from its media-control stream.
 final class BarFeed {
     private let sketchybar: URL
     private var pushed: [String: BarState] = [:]
@@ -1661,6 +1418,7 @@ final class BarFeed {
         let device = Audio.address(kAudioHardwarePropertyDefaultOutputDevice)
         if Audio.listen(Audio.system, device, listener) { audioWatches.append((Audio.system, device)) }
         network = NetworkState.watch(self)
+        appearanceChanged()
         audioChanged()
         networkChanged()
         pollTailscale()
@@ -1677,6 +1435,7 @@ final class BarFeed {
     // A restarted bar or a wake gets every value again, then fresh reads.
     func pushAll() {
         for state in pushed.values { publish(state, force: true) }
+        appearanceChanged()
         audioChanged()
         networkChanged()
         pollTailscale()
@@ -1710,6 +1469,13 @@ final class BarFeed {
             }
             self?.pushing = nil
         }
+    }
+
+    // The pills follow Reduce Transparency and Increase Contrast. System glass popups follow them on their own.
+    func appearanceChanged() {
+        let workspace = NSWorkspace.shared
+        publish(.appearance(reduceTransparency: workspace.accessibilityDisplayShouldReduceTransparency,
+                            increaseContrast: workspace.accessibilityDisplayShouldIncreaseContrast))
     }
 
     func networkChanged() {
@@ -1789,9 +1555,6 @@ final class Popups: NSObject, NSApplicationDelegate {
     var mediaSeeking = false
     var pendingMediaSeek: PendingMediaSeek?
     var initialCommand = PopupCommand.toggle(.volume)
-    lazy var island = Island(theme: theme, popups: self)
-    // Media opened from the island grows out of the notch instead of using the popup panel.
-    var inIsland = false
     var notchTask: Task<Void, Never>?
     var lock: Int32 = -1
     lazy var eventStore = EKEventStore()
@@ -1807,9 +1570,15 @@ final class Popups: NSObject, NSApplicationDelegate {
     var tailscaleCommand: Task<Void, Never>?
     var tailscaleLogin = false
     let bar: BarFeed
-    // One media-control stream feeds the bar item and, on a notched display, the island.
+    // One media-control stream feeds the bar item and the media popup.
     var mediaStream: Task<Void, Never>?
     var streamedMedia: MediaSnapshot?
+    // What the bar item shows, and the one task that fits it. A new fit replaces a pending one.
+    var mediaDisplay: MediaDisplay?
+    var mediaFitTask: Task<Void, Never>?
+    // The island width the last fit aims for, and the loop that moves the progress plate while a track plays.
+    var mediaIslandWidth: Double?
+    var mediaProgressLoop: Task<Void, Never>?
     // The system popup shows the bar's latest sample and adds GPU and top processes while open.
     var systemShown: SystemSample?
     var processes = ProcessSampler()
@@ -1821,9 +1590,6 @@ final class Popups: NSObject, NSApplicationDelegate {
         super.init()
     }
 
-    var popupWindow: NSPanel { inIsland ? island.panel : panel }
-
-    // The island panel stays on screen while compact, so visibility alone does not mean open.
     var isOpen: Bool {
         if case .open = lifecycle { return true }
         return false
@@ -1839,7 +1605,6 @@ final class Popups: NSObject, NSApplicationDelegate {
         panel.isReleasedWhenClosed = false
         panel.appearance = NSAppearance(named: .darkAqua)
         panel.acceptsMouseMovedEvents = true
-        island.panel.acceptsMouseMovedEvents = true
         if let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged], handler: { [weak self] _ in
             self?.pointerMoved()
         }) { monitors.append(monitor) }
@@ -1854,7 +1619,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         if let monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: { [weak self] event in
             guard let self, self.lifecycle.target != nil || self.candidate != nil else { return event }
             let point = NSEvent.mouseLocation
-            if !(self.isOpen && self.popupWindow.frame.contains(point)) { self.outsideClick(at: point) }
+            if !(self.isOpen && self.panel.frame.contains(point)) { self.outsideClick(at: point) }
             return event
         }) { monitors.append(monitor) }
         if let monitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
@@ -1874,6 +1639,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.willSleepNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(woke), name: NSWorkspace.didWakeNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displayOptionsChanged), name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(calendarChanged), name: .EKEventStoreChanged, object: nil)
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
@@ -1898,13 +1664,13 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
-        island.updateNotch()
         bar.start()
         startMediaStream()
         switch initialCommand {
         case .toggle(let source): show(source)
         case .hover(let source): show(source)
         case .volumeScroll(let notches): scrollVolume(notches)
+        case .media(let action): performMedia(action)
         case .geometry, .start, .hoverEnd, .stop: break
         }
     }
@@ -1916,7 +1682,13 @@ final class Popups: NSObject, NSApplicationDelegate {
         catch { logger.error("Changing the volume failed: \(error.localizedDescription, privacy: .public)") }
     }
 
-    @objc func woke() { bar.pushAll() }
+    // NSWorkspace posts this on the main thread, like the sleep and wake notifications above.
+    @objc func displayOptionsChanged() { bar.appearanceChanged() }
+
+    @objc func woke() {
+        bar.pushAll()
+        fitMedia(after: .milliseconds(350))
+    }
 
     func startMediaStream() {
         guard mediaStream == nil else { return }
@@ -1932,11 +1704,11 @@ final class Popups: NSObject, NSApplicationDelegate {
                     return
                 } catch MediaError.missingCLI {
                     logger.error("The media stream needs media-control on PATH.")
-                    self?.bar.publish(.mediaUnavailable)
+                    self?.showMedia(.unavailable)
                     return
                 } catch {
                     logger.error("The media stream failed: \(error.localizedDescription, privacy: .private)")
-                    self?.bar.publish(.mediaUnavailable)
+                    self?.showMedia(.unavailable)
                 }
                 // The stream ends when media-control or its system service restarts.
                 try? await Task.sleep(for: .seconds(5))
@@ -1946,15 +1718,94 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func streamed(_ snapshot: MediaSnapshot?) {
         streamedMedia = snapshot
-        bar.publish(.media(title: snapshot?.title ?? "", artist: snapshot?.artist ?? "", playing: snapshot?.playing ?? false))
-        if island.notch != nil { island.apply(snapshot) }
+        showMedia(MediaDisplay(snapshot))
+    }
+
+    func showMedia(_ display: MediaDisplay) {
+        mediaDisplay = display
+        fitMedia()
+        syncMediaProgress()
+    }
+
+    // The plate fills the island, less the inset on each side, in proportion to the elapsed time. The stream
+    // reports pauses, seeks, and track changes, which push at once. While a timed track plays, a loop pushes
+    // every 2 s. `publish` skips a width the bar already has.
+    func pushMediaProgress() {
+        guard case .track? = mediaDisplay, let timing = streamedMedia?.timing, let island = mediaIslandWidth else {
+            bar.publish(.mediaProgress(0))
+            return
+        }
+        let track = island - 2 * Double(theme.number("PROGRESS_INSET"))
+        bar.publish(.mediaProgress(max(0, Int((track * timing.elapsed / timing.duration).rounded(.down)))))
+    }
+
+    func syncMediaProgress() {
+        pushMediaProgress()
+        mediaProgressLoop?.cancel()
+        mediaProgressLoop = nil
+        guard case .track(_, _, true)? = mediaDisplay, streamedMedia?.timing != nil else { return }
+        mediaProgressLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, let self else { return }
+                self.pushMediaProgress()
+            }
+        }
+    }
+
+    // Measures the gap between the left island and the media island, then pushes the width and title that
+    // fill it. `publish` skips a state the bar already has, so a refit that changes nothing ends here and
+    // the geometry call that status.sh makes after the push does not loop.
+    func fitMedia(after delay: Duration = .zero) {
+        mediaFitTask?.cancel()
+        mediaFitTask = Task { [weak self] in
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            guard !Task.isCancelled, let layout = await self?.mediaLayout(), !Task.isCancelled, let self,
+                  let display = self.mediaDisplay else { return }
+            let gap = Double(self.theme.number("ISLAND_GAP"))
+            let fit = MediaFit(text: display.text, layout: layout, gap: gap, font: self.theme.font)
+            self.mediaIslandWidth = layout.islandWidth(gap: gap)
+            self.bar.publish(display.state(fit))
+            self.pushMediaProgress()
+        }
+    }
+
+    func queryItem(_ name: String) async -> ItemQuery? {
+        guard let result = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath), ["--query", name]),
+              !Task.isCancelled, result.status == 0 else { return nil }
+        return try? JSONDecoder().decode(ItemQuery.self, from: result.output)
+    }
+
+    func mediaLayout() async -> MediaLayout? {
+        guard let index = await barDisplayIndex(),
+              let left = await queryItem("half.left"), let prev = await queryItem("media.prev"),
+              let start = await queryItem("island.media.start"), let end = await queryItem("island.media.end"),
+              let media = await queryItem("media"), !Task.isCancelled,
+              let leftBounds = left.bounds(display: index), let prevBounds = prev.bounds(display: index),
+              let startBounds = start.bounds(display: index), let endBounds = end.bounds(display: index),
+              let icon = media.icon, let label = media.label else { return nil }
+        // q items fill leftward from the notch: notch.gap, island.media.end, volume, media.next, media.toggle,
+        // media.prev, then media. So media.prev's left edge is where media must end, whatever media's width is
+        // now. Measure only items nearer the notch than media.
+        let glyph = (icon.value as NSString).size(withAttributes: [.font: theme.iconFont]).width.rounded(.up)
+        return MediaLayout(leftEdge: leftBounds.minX + leftBounds.width, rightEdge: prevBounds.minX,
+                           islandEnd: endBounds.minX + endBounds.width, startWidth: startBounds.width,
+                           reserved: icon.paddingLeft + Double(glyph) + icon.paddingRight + label.paddingLeft + label.paddingRight)
+    }
+
+    // SketchyBar's arrangement index of the main display, which names the key in `bounding_rects`.
+    func barDisplayIndex() async -> Int? {
+        guard let displays = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath), ["--query", "displays"]),
+              !Task.isCancelled, displays.status == 0,
+              let objects = try? JSONSerialization.jsonObject(with: displays.output) as? [[String: Any]],
+              let display = objects.first(where: { ($0["DirectDisplayID"] as? NSNumber)?.uint32Value == CGMainDisplayID() }) else { return nil }
+        return display["arrangement-id"] as? Int
     }
 
     @objc func screensChanged() {
         close()
-        guard island.updateNotch() else { return }
-        if island.notch != nil { island.apply(streamedMedia) }
-        // notch.sh moves the bar between its floating and notched layouts.
+        // notch.sh sets the notch width for the new display, which moves the media island.
+        fitMedia(after: .milliseconds(350))
         notchTask?.cancel()
         notchTask = Task { [weak self] in await self?.trigger("notch_change") }
     }
@@ -1972,10 +1823,13 @@ final class Popups: NSObject, NSApplicationDelegate {
         tailscaleCommand = nil
         notchTask?.cancel()
         notchTask = nil
+        mediaFitTask?.cancel()
+        mediaFitTask = nil
+        mediaProgressLoop?.cancel()
+        mediaProgressLoop = nil
         mediaStream?.cancel()
         mediaStream = nil
         bar.stop()
-        island.stop()
         ProcessCapture.terminateRunningChildren()
         timer?.invalidate()
         for monitor in monitors { NSEvent.removeMonitor(monitor) }
@@ -2004,12 +1858,13 @@ final class Popups: NSObject, NSApplicationDelegate {
         case .hoverEnd(let source):
             if lifecycle.target?.source.identity == source.identity { pointerMoved() }
             else if case .dismissed(let identity, _) = lifecycle, identity == source.identity { pointerMoved() }
-        case .start: bar.pushAll()
+        case .start:
+            bar.pushAll()
+            fitMedia()
         case .toggle(let source): show(source)
+        case .media(let action): performMedia(action)
         }
     }
-
-    func islandExited() { pointerMoved() }
 
     func outsideClick(at point: NSPoint) {
         if openingHasAnchor && anchor.contains(point) { return }
@@ -2023,10 +1878,13 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     func geometryChanged() {
+        // status.sh calls this after every update, and spaces.sh again once its size animation settles
+        // (about 0.2 s), so the fit waits for the last call.
+        fitMedia(after: .milliseconds(350))
         geometryGeneration += 1
         geometryTask?.cancel()
         geometryTask = nil
-        guard let target = lifecycle.target, openingHasAnchor, !inIsland else { return }
+        guard let target = lifecycle.target, openingHasAnchor else { return }
         let generation = geometryGeneration
         let source: PopupSource
         switch target.source {
@@ -2056,11 +1914,7 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func queryAnchor(_ source: PopupSource) async -> NSRect? {
         let executable = URL(fileURLWithPath: theme.sketchybarPath)
-        guard let displays = try? await ProcessCapture().run(executable, ["--query", "displays"]),
-              !Task.isCancelled, displays.status == 0,
-              let objects = try? JSONSerialization.jsonObject(with: displays.output) as? [[String: Any]],
-              let display = objects.first(where: { ($0["DirectDisplayID"] as? NSNumber)?.uint32Value == CGMainDisplayID() }),
-              let index = display["arrangement-id"] as? Int, let screen = NSScreen.screens.first else { return nil }
+        guard let index = await barDisplayIndex(), let screen = NSScreen.screens.first else { return nil }
         let names: [String]
         switch source {
         case .system, .cpu, .memory: names = ["system.cpu", "system.memory"]
@@ -2115,7 +1969,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         guard lifecycle.target != nil, openingHasAnchor, geometryTask == nil else { return }
         if anchor.contains(point) { return }
         if isOpen {
-            let popup = popupWindow.frame
+            let popup = panel.frame
             if popup.contains(point) { return }
             let left = max(anchor.minX, popup.minX)
             let right = min(anchor.maxX, popup.maxX)
@@ -2156,11 +2010,7 @@ final class Popups: NSObject, NSApplicationDelegate {
                 var rect: NSRect?
                 repeat {
                     let generation = self.geometryGeneration
-                    if source.kind == .media, self.island.notch != nil {
-                        rect = self.island.panel.isVisible ? self.island.panel.frame : nil
-                    } else {
-                        rect = await self.queryAnchor(source)
-                    }
+                    rect = await self.queryAnchor(source)
                     guard !Task.isCancelled else {
                         interactionLogger.debug("event=probe_cancelled kind=\(source.kind.rawValue, privacy: .public) generation=\(generation)")
                         return
@@ -2188,29 +2038,6 @@ final class Popups: NSObject, NSApplicationDelegate {
         candidate = target
         interactionLogger.debug("event=candidate_start kind=\(source.kind.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public) generation=\(self.geometryGeneration)")
         let next = source.kind
-        if next == .media, island.notch != nil {
-            guard island.panel.isVisible, island.panel.frame.contains(NSEvent.mouseLocation) else {
-                interactionLogger.debug("event=candidate_rejected kind=media id=\(target.id.uuidString, privacy: .public) reason=island_or_pointer")
-                candidate = nil
-                candidateTask = nil
-                return
-            }
-            interactionLogger.debug("event=candidate_accepted kind=media id=\(target.id.uuidString, privacy: .public)")
-            candidate = nil
-            candidateTask = nil
-            dismiss(suppress: false)
-            lifecycle = .opening(target)
-            inIsland = true
-            anchor = island.panel.frame
-            openingHasAnchor = true
-            media = island.media
-            mediaError = nil
-            buildMedia()
-            lifecycle = .open(target)
-            island.panel.makeKeyAndOrderFront(nil)
-            interactionLogger.debug("event=panel_ordered kind=media id=\(target.id.uuidString, privacy: .public) panel=island")
-            return
-        }
         candidateTask = Task { [weak self] in
             guard let self else { return }
             var rect: NSRect?
@@ -2328,33 +2155,33 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
         mediaSeeking = false
         pendingMediaSeek = nil
-        if inIsland {
-            inIsland = false
-            island.collapse()
-        }
         panel.orderOut(nil)
     }
 
-    func surface(height: CGFloat) -> NSView {
-        if inIsland { return island.expand(height: height) }
-        let width = theme.number("POPUP_WIDTH")
+    // The panel holds system glass. Only the glass view's contentView is guaranteed to sit inside the glass,
+    // so the flipped content view, or the container of the scroll view that holds it, is that contentView.
+    func surface(width: CGFloat, height: CGFloat) -> NSView {
         let screen = NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.screens[0]
         let inset = theme.number("POPUP_GAP")
         let x = max(screen.frame.minX + inset, min(anchor.midX - width / 2, screen.frame.maxX - inset - width))
         let visibleHeight = min(height, anchor.minY - screen.visibleFrame.minY - inset * 2)
         panel.setFrame(NSRect(x: x, y: anchor.minY - inset - visibleHeight, width: width, height: visibleHeight), display: false)
-        let view = Surface(frame: NSRect(x: 0, y: 0, width: width, height: height), theme: theme)
+        let view = FlippedView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        let glass = NSGlassEffectView(frame: NSRect(x: 0, y: 0, width: width, height: visibleHeight))
+        glass.style = .regular
+        glass.cornerRadius = theme.number("POPUP_RADIUS")
         if height > visibleHeight {
-            let background = Surface(frame: NSRect(x: 0, y: 0, width: width, height: visibleHeight), theme: theme)
-            let scroll = NSScrollView(frame: background.bounds.insetBy(dx: 1, dy: theme.number("POPUP_RADIUS")))
+            let container = NSView(frame: glass.bounds)
+            let scroll = NSScrollView(frame: container.bounds.insetBy(dx: 1, dy: theme.number("POPUP_RADIUS")))
             scroll.drawsBackground = false
             scroll.hasVerticalScroller = true
             scroll.documentView = view
-            background.addSubview(scroll)
-            panel.contentView = background
+            container.addSubview(scroll)
+            glass.contentView = container
         } else {
-            panel.contentView = view
+            glass.contentView = view
         }
+        panel.contentView = glass
         panel.title = item?.rawValue ?? ""
         return view
     }
@@ -2374,9 +2201,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         let devices = devices ?? Audio.devices()
         let current = current ?? Audio.current
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .volume)
         let row = theme.number("POPUP_ROW")
-        let view = surface(height: pad * 2 + row * CGFloat(3 + devices.count))
+        let view = surface(width: width, height: pad * 2 + row * CGFloat(3 + devices.count))
         label("Volume", x: pad, y: pad, width: width - pad * 2 - 50, in: view)
         percentage = label("", x: width - pad - 50, y: pad, width: 50, color: "TEXT2", in: view)
         percentage?.alignment = .right
@@ -2476,12 +2303,12 @@ final class Popups: NSObject, NSApplicationDelegate {
         mediaElapsed = nil
         mediaDuration = nil
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .media)
         let row = theme.number("POPUP_ROW")
         let artworkSize: CGFloat = 48
         let contentY = pad + row
         let timingHeight = media?.timing == nil ? 0 : row
-        let view = surface(height: pad * 2 + row * 2 + artworkSize + 16 + timingHeight)
+        let view = surface(width: width, height: pad * 2 + row * 2 + artworkSize + 16 + timingHeight)
         label("Now Playing", x: pad, y: pad, width: width - pad * 2 - 100, in: view)
         let application = label(media?.applicationName ?? "", x: width - pad - 100, y: pad, width: 100, color: "TEXT3", in: view)
         application.alignment = .right
@@ -2596,7 +2423,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             } catch {
                 guard !Task.isCancelled, self.item == .media, self.isOpen else { return }
                 self.pendingMediaSeek = nil
-                NSAlert(error: error).beginSheetModal(for: self.popupWindow, completionHandler: nil)
+                NSAlert(error: error).beginSheetModal(for: self.panel, completionHandler: nil)
             }
         }
         mediaActionTask = task
@@ -2620,8 +2447,10 @@ final class Popups: NSObject, NSApplicationDelegate {
             do {
                 try await Media.perform(action)
             } catch {
+                // The bar controls run with the popup closed, so the log is the only record then.
+                logger.error("Media \(action.argument, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
                 guard !Task.isCancelled, self.item == .media, self.isOpen else { return }
-                NSAlert(error: error).beginSheetModal(for: self.popupWindow, completionHandler: nil)
+                NSAlert(error: error).beginSheetModal(for: self.panel, completionHandler: nil)
             }
         }
         mediaActionTask = task
@@ -2655,9 +2484,9 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func buildFront() {
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .front)
         let row = theme.number("POPUP_ROW")
-        let view = surface(height: pad * 2 + row * 3)
+        let view = surface(width: width, height: pad * 2 + row * 3)
         label("Front app", x: pad, y: pad, width: width - pad * 2, in: view)
         let name = front?.appName.flatMap { $0.isEmpty ? nil : $0 } ?? "Unavailable"
         let title = front?.windowTitle.flatMap { $0.isEmpty ? nil : $0 } ?? "Window unavailable"
@@ -2744,9 +2573,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         default: return
         }
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: source.kind)
         let row = theme.number("POPUP_ROW")
-        let view = surface(height: pad * 2 + row * CGFloat(1 + information.count))
+        let view = surface(width: width, height: pad * 2 + row * CGFloat(1 + information.count))
         label(title, x: pad, y: pad, width: width - pad * 2, in: view)
         for (index, line) in information.enumerated() {
             label(line, x: pad, y: pad + row * CGFloat(index + 1), width: width - pad * 2, color: "TEXT2", in: view)
@@ -2764,9 +2593,9 @@ final class Popups: NSObject, NSApplicationDelegate {
     func buildNetwork() {
         let connections = networkState?.connections ?? []
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .network)
         let row = theme.number("POPUP_ROW")
-        let view = surface(height: pad * 2 + row * CGFloat(3 + connections.count * 2))
+        let view = surface(width: width, height: pad * 2 + row * CGFloat(3 + connections.count * 2))
         label("Network", x: pad, y: pad, width: width - pad * 2, in: view)
         for (index, connection) in connections.enumerated() {
             let y = pad + row * CGFloat(1 + index * 2)
@@ -2805,13 +2634,13 @@ final class Popups: NSObject, NSApplicationDelegate {
         systemShown = bar.system
         let sample = bar.system
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .system)
         let row = theme.number("POPUP_ROW")
         let clusters = sample?.clusters ?? []
         // Three process rows always, so the panel keeps its height between refreshes.
         let rows = CGFloat(15 + clusters.count + 3)
         let meterHeight: CGFloat = 8, legendHeight: CGFloat = 24
-        let view = surface(height: pad * 2 + row * rows + meterHeight * 2 + legendHeight)
+        let view = surface(width: width, height: pad * 2 + row * rows + meterHeight * 2 + legendHeight)
         var y = pad
         func next() -> CGFloat { defer { y += row }; return y }
         let valueFont = NSFont.monospacedDigitSystemFont(ofSize: theme.font.pointSize, weight: .semibold)
@@ -3010,7 +2839,7 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func buildTailscale() {
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .tailscale)
         let row = theme.number("POPUP_ROW")
         let state = try? tailscale?.get()
         let backend = state?.status.backend
@@ -3024,7 +2853,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         if loggedIn { rows += 4 }
         // A daemon error wraps onto a second line. Otherwise the admin link closes the popup.
         rows += 1
-        let view = surface(height: pad * 2 + row * rows)
+        let view = surface(width: width, height: pad * 2 + row * rows)
         var y = pad
         func next() -> CGFloat { defer { y += row }; return y }
 
@@ -3281,11 +3110,11 @@ final class Popups: NSObject, NSApplicationDelegate {
         let weeks = (offset + days.count + 6) / 7
         let pad = theme.number("POPUP_PADDING")
         let row = theme.number("POPUP_ROW")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .clock)
         let column = (width - pad * 2) / 7
         let eventsY = pad + row * CGFloat(weeks + 2) + theme.number("POPUP_GAP")
         let errorHeight: CGFloat = calendarError == nil ? 0 : row * 3
-        let view = surface(height: eventsY + row + CGFloat(events.count) * row + errorHeight + pad)
+        let view = surface(width: width, height: eventsY + row + CGFloat(events.count) * row + errorHeight + pad)
         let formatter = DateFormatter()
         formatter.locale = .autoupdatingCurrent
         formatter.calendar = calendar
