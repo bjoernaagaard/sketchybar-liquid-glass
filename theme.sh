@@ -56,9 +56,19 @@ PROGRESS_INSET=2
 PROGRESS_HEIGHT=26
 PROGRESS_RADIUS=10
 
-# Native popups share the bar material without blur or size animation.
+# Native popups draw on system glass (NSGlassEffectView) with no size animation. The bar itself stays without blur.
+# Each width is the widest fixed row in SF Pro Semibold 13 plus POPUP_PADDING * 2. Text of any length (track titles,
+# device names, event titles) truncates, so a width only keeps the common case whole. Bash 3.2 has no associative
+# arrays, so each kind has its own variable. Battery, workspace and mode share INFORMATION.
 POPUP_RADIUS=12
-POPUP_WIDTH=280
+POPUP_WIDTH_VOLUME=220      # "✓  Studio Display Speakers" 171
+POPUP_WIDTH_CLOCK=252       # seven day columns of 31.4 hold the 22 pt today circle
+POPUP_WIDTH_NETWORK=244     # "Thunderbolt Ethernet Slot 0" at the 22 pt indent, which 232 cut on the bar
+POPUP_WIDTH_TAILSCALE=260   # "Allow Incoming Connections" checkbox 201
+POPUP_WIDTH_MEDIA=280       # 128 pt seek slider between two 56 pt time labels
+POPUP_WIDTH_SYSTEM=280      # memory legend at 11 pt, 240
+POPUP_WIDTH_FRONT=240       # window titles are long; the app name needs 120
+POPUP_WIDTH_INFORMATION=220 # "Visual Studio Code  3" 135
 POPUP_GAP=8
 POPUP_PADDING=16
 POPUP_ROW=32

@@ -819,7 +819,9 @@ struct Theme {
         guard let pid = Int32(try required("POPUP_BAR_PID")), pid > 0 else { throw ConfigurationError.invalidValue("POPUP_BAR_PID") }
         barPID = pid
         var numbers: [String: CGFloat] = [:]
-        for name in ["POPUP_RADIUS", "POPUP_WIDTH", "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE", "ISLAND_GAP", "PROGRESS_INSET"] {
+        for name in ["POPUP_RADIUS", "POPUP_WIDTH_VOLUME", "POPUP_WIDTH_CLOCK", "POPUP_WIDTH_NETWORK", "POPUP_WIDTH_TAILSCALE",
+                     "POPUP_WIDTH_MEDIA", "POPUP_WIDTH_SYSTEM", "POPUP_WIDTH_FRONT", "POPUP_WIDTH_INFORMATION",
+                     "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE", "ISLAND_GAP", "PROGRESS_INSET"] {
             guard let value = Double(try required(name)), value.isFinite, value >= 0 else { throw ConfigurationError.invalidValue(name) }
             numbers[name] = CGFloat(value)
         }
@@ -841,6 +843,20 @@ struct Theme {
         return value
     }
 
+    // Each width is measured from the popup's fixed rows (theme.sh). A new kind must choose one here.
+    func width(for kind: PopupKind) -> CGFloat {
+        switch kind {
+        case .volume: number("POPUP_WIDTH_VOLUME")
+        case .clock: number("POPUP_WIDTH_CLOCK")
+        case .network: number("POPUP_WIDTH_NETWORK")
+        case .tailscale: number("POPUP_WIDTH_TAILSCALE")
+        case .media: number("POPUP_WIDTH_MEDIA")
+        case .system: number("POPUP_WIDTH_SYSTEM")
+        case .front: number("POPUP_WIDTH_FRONT")
+        case .battery, .workspace, .mode: number("POPUP_WIDTH_INFORMATION")
+        }
+    }
+
     func color(_ name: String) -> NSColor {
         guard let value = colors[name] else { preconditionFailure("Unknown color key: \(name)") }
         return value
@@ -855,20 +871,6 @@ final class PopupPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
     override func cancelOperation(_ sender: Any?) { orderOut(nil) }
-}
-
-final class Surface: NSView {
-    let theme: Theme
-    init(frame: NSRect, theme: Theme) { self.theme = theme; super.init(frame: frame) }
-    required init?(coder: NSCoder) { fatalError("Surface is constructed in code, not decoded from an archive.") }
-    override var isFlipped: Bool { true }
-    override func draw(_ dirtyRect: NSRect) {
-        guard enclosingScrollView == nil else { return }
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                               xRadius: theme.number("POPUP_RADIUS"), yRadius: theme.number("POPUP_RADIUS"))
-        theme.color("BAR_COLOR").setFill(); path.fill()
-        theme.color("BAR_EDGE").setStroke(); path.lineWidth = 1; path.stroke()
-    }
 }
 
 // One item as `sketchybar --query <item>` reports it.
@@ -2139,25 +2141,30 @@ final class Popups: NSObject, NSApplicationDelegate {
         panel.orderOut(nil)
     }
 
-    func surface(height: CGFloat) -> NSView {
-        let width = theme.number("POPUP_WIDTH")
+    // The panel holds system glass. Only the glass view's contentView is guaranteed to sit inside the glass,
+    // so the flipped content view, or the container of the scroll view that holds it, is that contentView.
+    func surface(width: CGFloat, height: CGFloat) -> NSView {
         let screen = NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.screens[0]
         let inset = theme.number("POPUP_GAP")
         let x = max(screen.frame.minX + inset, min(anchor.midX - width / 2, screen.frame.maxX - inset - width))
         let visibleHeight = min(height, anchor.minY - screen.visibleFrame.minY - inset * 2)
         panel.setFrame(NSRect(x: x, y: anchor.minY - inset - visibleHeight, width: width, height: visibleHeight), display: false)
-        let view = Surface(frame: NSRect(x: 0, y: 0, width: width, height: height), theme: theme)
+        let view = FlippedView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        let glass = NSGlassEffectView(frame: NSRect(x: 0, y: 0, width: width, height: visibleHeight))
+        glass.style = .regular
+        glass.cornerRadius = theme.number("POPUP_RADIUS")
         if height > visibleHeight {
-            let background = Surface(frame: NSRect(x: 0, y: 0, width: width, height: visibleHeight), theme: theme)
-            let scroll = NSScrollView(frame: background.bounds.insetBy(dx: 1, dy: theme.number("POPUP_RADIUS")))
+            let container = NSView(frame: glass.bounds)
+            let scroll = NSScrollView(frame: container.bounds.insetBy(dx: 1, dy: theme.number("POPUP_RADIUS")))
             scroll.drawsBackground = false
             scroll.hasVerticalScroller = true
             scroll.documentView = view
-            background.addSubview(scroll)
-            panel.contentView = background
+            container.addSubview(scroll)
+            glass.contentView = container
         } else {
-            panel.contentView = view
+            glass.contentView = view
         }
+        panel.contentView = glass
         panel.title = item?.rawValue ?? ""
         return view
     }
@@ -2177,9 +2184,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         let devices = devices ?? Audio.devices()
         let current = current ?? Audio.current
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .volume)
         let row = theme.number("POPUP_ROW")
-        let view = surface(height: pad * 2 + row * CGFloat(3 + devices.count))
+        let view = surface(width: width, height: pad * 2 + row * CGFloat(3 + devices.count))
         label("Volume", x: pad, y: pad, width: width - pad * 2 - 50, in: view)
         percentage = label("", x: width - pad - 50, y: pad, width: 50, color: "TEXT2", in: view)
         percentage?.alignment = .right
@@ -2279,12 +2286,12 @@ final class Popups: NSObject, NSApplicationDelegate {
         mediaElapsed = nil
         mediaDuration = nil
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .media)
         let row = theme.number("POPUP_ROW")
         let artworkSize: CGFloat = 48
         let contentY = pad + row
         let timingHeight = media?.timing == nil ? 0 : row
-        let view = surface(height: pad * 2 + row * 2 + artworkSize + 16 + timingHeight)
+        let view = surface(width: width, height: pad * 2 + row * 2 + artworkSize + 16 + timingHeight)
         label("Now Playing", x: pad, y: pad, width: width - pad * 2 - 100, in: view)
         let application = label(media?.applicationName ?? "", x: width - pad - 100, y: pad, width: 100, color: "TEXT3", in: view)
         application.alignment = .right
@@ -2460,9 +2467,9 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func buildFront() {
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .front)
         let row = theme.number("POPUP_ROW")
-        let view = surface(height: pad * 2 + row * 3)
+        let view = surface(width: width, height: pad * 2 + row * 3)
         label("Front app", x: pad, y: pad, width: width - pad * 2, in: view)
         let name = front?.appName.flatMap { $0.isEmpty ? nil : $0 } ?? "Unavailable"
         let title = front?.windowTitle.flatMap { $0.isEmpty ? nil : $0 } ?? "Window unavailable"
@@ -2549,9 +2556,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         default: return
         }
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: source.kind)
         let row = theme.number("POPUP_ROW")
-        let view = surface(height: pad * 2 + row * CGFloat(1 + information.count))
+        let view = surface(width: width, height: pad * 2 + row * CGFloat(1 + information.count))
         label(title, x: pad, y: pad, width: width - pad * 2, in: view)
         for (index, line) in information.enumerated() {
             label(line, x: pad, y: pad + row * CGFloat(index + 1), width: width - pad * 2, color: "TEXT2", in: view)
@@ -2569,9 +2576,9 @@ final class Popups: NSObject, NSApplicationDelegate {
     func buildNetwork() {
         let connections = networkState?.connections ?? []
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .network)
         let row = theme.number("POPUP_ROW")
-        let view = surface(height: pad * 2 + row * CGFloat(3 + connections.count * 2))
+        let view = surface(width: width, height: pad * 2 + row * CGFloat(3 + connections.count * 2))
         label("Network", x: pad, y: pad, width: width - pad * 2, in: view)
         for (index, connection) in connections.enumerated() {
             let y = pad + row * CGFloat(1 + index * 2)
@@ -2610,13 +2617,13 @@ final class Popups: NSObject, NSApplicationDelegate {
         systemShown = bar.system
         let sample = bar.system
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .system)
         let row = theme.number("POPUP_ROW")
         let clusters = sample?.clusters ?? []
         // Three process rows always, so the panel keeps its height between refreshes.
         let rows = CGFloat(15 + clusters.count + 3)
         let meterHeight: CGFloat = 8, legendHeight: CGFloat = 24
-        let view = surface(height: pad * 2 + row * rows + meterHeight * 2 + legendHeight)
+        let view = surface(width: width, height: pad * 2 + row * rows + meterHeight * 2 + legendHeight)
         var y = pad
         func next() -> CGFloat { defer { y += row }; return y }
         let valueFont = NSFont.monospacedDigitSystemFont(ofSize: theme.font.pointSize, weight: .semibold)
@@ -2815,7 +2822,7 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func buildTailscale() {
         let pad = theme.number("POPUP_PADDING")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .tailscale)
         let row = theme.number("POPUP_ROW")
         let state = try? tailscale?.get()
         let backend = state?.status.backend
@@ -2829,7 +2836,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         if loggedIn { rows += 4 }
         // A daemon error wraps onto a second line. Otherwise the admin link closes the popup.
         rows += 1
-        let view = surface(height: pad * 2 + row * rows)
+        let view = surface(width: width, height: pad * 2 + row * rows)
         var y = pad
         func next() -> CGFloat { defer { y += row }; return y }
 
@@ -3086,11 +3093,11 @@ final class Popups: NSObject, NSApplicationDelegate {
         let weeks = (offset + days.count + 6) / 7
         let pad = theme.number("POPUP_PADDING")
         let row = theme.number("POPUP_ROW")
-        let width = theme.number("POPUP_WIDTH")
+        let width = theme.width(for: .clock)
         let column = (width - pad * 2) / 7
         let eventsY = pad + row * CGFloat(weeks + 2) + theme.number("POPUP_GAP")
         let errorHeight: CGFloat = calendarError == nil ? 0 : row * 3
-        let view = surface(height: eventsY + row + CGFloat(events.count) * row + errorHeight + pad)
+        let view = surface(width: width, height: eventsY + row + CGFloat(events.count) * row + errorHeight + pad)
         let formatter = DateFormatter()
         formatter.locale = .autoupdatingCurrent
         formatter.calendar = calendar
