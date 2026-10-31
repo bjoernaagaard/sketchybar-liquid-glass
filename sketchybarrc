@@ -38,8 +38,8 @@ a+=(--add item half.left.start left
 
     --add item mode left
     --set mode drawing=off updates=on padding_left=2 label.color=$TEXT label.padding_left=8 label.padding_right=8
-               background.drawing=on background.color=$PILL script="$PLUGIN_DIR/status.sh"
-    --subscribe mode aerospace_mode_change)
+               background.drawing=on background.color=$PILL script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh mode"
+    --subscribe mode aerospace_mode_change mouse.entered mouse.exited)
 
 gap sep.l 6
 a+=(--add item sep left
@@ -51,10 +51,11 @@ a+=(--add item spaces left
     --subscribe spaces aerospace_workspace_change aerospace_focus_change front_app_switched space_windows_change system_woke
 
     --add item front.icon left
-    --set front.icon width=$APP_SLOT background.drawing=on background.image.scale=$ICON_SCALE
+    --set front.icon width=$APP_SLOT background.drawing=on background.image.scale=$ICON_SCALE script="$PLUGIN_DIR/hover.sh" click_script="$PLUGIN_DIR/popup.sh front.icon"
+    --subscribe front.icon mouse.entered mouse.exited
 
     --add item front left
-    --set front label.padding_left=4 label.padding_right=8 script="$PLUGIN_DIR/hover.sh"
+    --set front label.padding_left=4 label.padding_right=8 script="$PLUGIN_DIR/hover.sh" click_script="$PLUGIN_DIR/popup.sh front"
     --subscribe front mouse.entered mouse.exited
 
     --add item half.left.end left
@@ -76,7 +77,7 @@ a+=(--add item half.right.end right
 
     --add item battery right
     --set battery icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
-                  update_freq=120 script="$PLUGIN_DIR/status.sh"
+                  update_freq=120 script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh battery"
     --subscribe battery power_source_change system_woke mouse.entered mouse.exited
 
     --add item volume right
@@ -113,14 +114,14 @@ a+=(--add item half.right.end right
                      updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh system"
     --subscribe system.cpu system_state mouse.entered mouse.exited
 
-    --add bracket system system.cpu system.memory
-    --set system background.color=$CLEAR background.height=22 background.corner_radius=8
-
     --add item half.right.start right
     --set half.right.start width=4
 
     --add bracket half.right half.right.start half.right.end
-    --set half.right "${PILL_STYLE[@]}" background.drawing=off)
+    --set half.right "${PILL_STYLE[@]}" background.drawing=off
+
+    --add bracket system system.cpu system.memory
+    --set system background.color=$CLEAR background.height=22 background.corner_radius=8)
 
 $SB "${a[@]}"
 # The resident helper draws the island on a notched display and reports display changes.

@@ -7,14 +7,98 @@ import SystemConfiguration
 import os
 
 private let logger = Logger(subsystem: "com.bjoernaagaard.sketchybar", category: "popup")
+private let interactionLogger = Logger(subsystem: "com.bjoernaagaard.sketchybar", category: "popup.interaction")
 
 enum PopupKind: String {
-    case volume, clock, network, tailscale, media, system
+    case volume, clock, network, tailscale, media, system, front, battery, workspace, mode
+}
+
+enum PopupSource: Equatable {
+    case volume, clock, network, tailscale, media, system, cpu, memory, front, frontIcon, battery, mode
+    case workspace(String, String)
+
+    init?(rawValue: String) {
+        switch rawValue {
+        case "volume": self = .volume
+        case "clock": self = .clock
+        case "network": self = .network
+        case "tailscale": self = .tailscale
+        case "media": self = .media
+        case "system": self = .system
+        case "system.cpu": self = .cpu
+        case "system.memory": self = .memory
+        case "front": self = .front
+        case "front.icon": self = .frontIcon
+        case "battery": self = .battery
+        case "mode": self = .mode
+        default:
+            let parts = rawValue.split(separator: ".", omittingEmptySubsequences: false)
+            guard (parts.count == 2 || parts.count == 3), parts[0] == "ws",
+                  !parts[1].isEmpty, parts[1].utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95 }),
+                  parts.count == 2 || (parts[2].first == "a" && parts[2].dropFirst().allSatisfy(\.isNumber) && parts[2].count > 1) else { return nil }
+            self = .workspace(String(parts[1]), rawValue)
+        }
+    }
+
+    var rawValue: String {
+        switch self {
+        case .volume: "volume"
+        case .clock: "clock"
+        case .network: "network"
+        case .tailscale: "tailscale"
+        case .media: "media"
+        case .system: "system"
+        case .cpu: "system.cpu"
+        case .memory: "system.memory"
+        case .front: "front"
+        case .frontIcon: "front.icon"
+        case .battery: "battery"
+        case .mode: "mode"
+        case .workspace(_, let item): item
+        }
+    }
+
+    var kind: PopupKind {
+        switch self {
+        case .volume: .volume
+        case .clock: .clock
+        case .network: .network
+        case .tailscale: .tailscale
+        case .media: .media
+        case .system, .cpu, .memory: .system
+        case .front, .frontIcon: .front
+        case .battery: .battery
+        case .mode: .mode
+        case .workspace: .workspace
+        }
+    }
+
+    var identity: String {
+        if case .workspace(let id, _) = self { return "workspace.\(id)" }
+        return kind.rawValue
+    }
+}
+
+struct PopupTarget {
+    let id: UUID
+    let source: PopupSource
+    var kind: PopupKind { source.kind }
+}
+
+enum PopupLifecycle {
+    case closed, opening(PopupTarget), open(PopupTarget), dismissed(String, NSRect?)
+
+    var target: PopupTarget? {
+        switch self {
+        case .opening(let target), .open(let target): target
+        case .closed, .dismissed: nil
+        }
+    }
 }
 
 // Commands for the running helper. Strings exist only at the shell and notification boundary.
 enum PopupCommand {
-    case toggle(PopupKind), hover, hoverEnd, start, stop, volumeScroll(notches: Int)
+    case toggle(PopupSource), hover(PopupSource), hoverEnd(PopupSource), geometry, start, stop, volumeScroll(notches: Int)
 
     init?(_ raw: String, argument: String? = nil) {
         switch raw {
@@ -22,12 +106,14 @@ enum PopupCommand {
             // status.sh passes SketchyBar's SCROLL_DELTA.
             guard let argument, let delta = Double(argument), delta.isFinite else { return nil }
             self = .volumeScroll(notches: Int(min(50, max(-50, delta)).rounded()))
-        case "media-hover": self = .hover
-        case "media-hover-end": self = .hoverEnd
+        case "hover", "hover-end":
+            guard let argument, let source = PopupSource(rawValue: argument) else { return nil }
+            self = raw == "hover" ? .hover(source) : .hoverEnd(source)
+        case "geometry": self = .geometry
         case "start": self = .start
         case "stop": self = .stop
         default:
-            guard let popup = PopupKind(rawValue: raw) else { return nil }
+            guard let popup = PopupSource(rawValue: raw) else { return nil }
             self = .toggle(popup)
         }
     }
@@ -35,8 +121,9 @@ enum PopupCommand {
     var rawValue: String {
         switch self {
         case .toggle(let popup): popup.rawValue
-        case .hover: "media-hover"
-        case .hoverEnd: "media-hover-end"
+        case .hover: "hover"
+        case .hoverEnd: "hover-end"
+        case .geometry: "geometry"
         case .start: "start"
         case .stop: "stop"
         case .volumeScroll: "volume-scroll"
@@ -46,7 +133,8 @@ enum PopupCommand {
     var userInfo: [String: String] {
         switch self {
         case .volumeScroll(let notches): ["item": rawValue, "argument": String(notches)]
-        case .toggle, .hover, .hoverEnd, .start, .stop: ["item": rawValue]
+        case .hover(let source), .hoverEnd(let source): ["item": rawValue, "argument": source.rawValue]
+        case .toggle, .geometry, .start, .stop: ["item": rawValue]
         }
     }
 
@@ -505,6 +593,14 @@ struct NetworkState: Equatable {
             ?? (connections.contains(where: { $0.active }) ? NetworkKind.network : .none)
         return NetworkState(connections: connections, kind: kind)
     }
+}
+
+private func readNetworkState(context: String) -> NetworkState? {
+    let start = ProcessInfo.processInfo.systemUptime
+    let state = NetworkState.read()
+    let milliseconds = (ProcessInfo.processInfo.systemUptime - start) * 1_000
+    interactionLogger.debug("event=network_read context=\(context, privacy: .public) elapsed_ms=\(milliseconds) success=\(state != nil)")
+    return state
 }
 
 enum TailscaleError: LocalizedError {
@@ -1159,6 +1255,15 @@ final class OutputButton: NSButton {
     var device: AudioObjectID = 0
 }
 
+struct FrontSnapshot: Decodable, Equatable {
+    let appName: String?
+    let windowTitle: String?
+
+    enum CodingKeys: String, CodingKey {
+        case appName = "app-name", windowTitle = "window-title"
+    }
+}
+
 struct CalendarEvent {
     let title: String
     let start: Date
@@ -1608,7 +1713,7 @@ final class BarFeed {
     }
 
     func networkChanged() {
-        guard let state = NetworkState.read() else { return }
+        guard let state = readNetworkState(context: "bar") else { return }
         primaryInterface = (state.connections.first { $0.primary } ?? state.connections.first { $0.active })?.interface
         publish(.network(state.kind))
     }
@@ -1652,12 +1757,19 @@ final class Popups: NSObject, NSApplicationDelegate {
     static let notification = Notification.Name("com.bjoernaagaard.sketchybar.popup")
     let theme: Theme
     let panel = PopupPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-    var item: PopupKind?
-    var openingTask: Task<Void, Never>?
+    var lifecycle: PopupLifecycle = .closed
+    var item: PopupKind? { lifecycle.target?.kind }
+    var candidateTask: Task<Void, Never>?
+    var candidate: PopupTarget?
+    var candidateProbes: [String: Task<Void, Never>] = [:]
+    var probeSources: [String: PopupSource] = [:]
+    var pendingClick: NSPoint?
+    var geometryGeneration = 0
+    var geometryTask: Task<Void, Never>?
     var refreshTask: Task<Void, Never>?
     var mediaActionTask: Task<Void, Never>?
     var mediaActionTasks: [UUID: Task<Void, Never>] = [:]
-    var openingClicks: [NSPoint] = []
+    var suppressionPoints: [NSPoint] = []
     var openingHasAnchor = false
     var anchor = NSRect.zero
     var monitors: [Any] = []
@@ -1667,6 +1779,8 @@ final class Popups: NSObject, NSApplicationDelegate {
     var mute: NSButton?
     var deviceSignature = ""
     var networkState: NetworkState?
+    var front: FrontSnapshot?
+    var information: [String] = []
     var media: MediaSnapshot?
     var mediaError: MediaError?
     var mediaSlider: NSSlider?
@@ -1675,7 +1789,6 @@ final class Popups: NSObject, NSApplicationDelegate {
     var mediaSeeking = false
     var pendingMediaSeek: PendingMediaSeek?
     var initialCommand = PopupCommand.toggle(.volume)
-    var hoverCanClose = false
     lazy var island = Island(theme: theme, popups: self)
     // Media opened from the island grows out of the notch instead of using the popup panel.
     var inIsland = false
@@ -1711,7 +1824,10 @@ final class Popups: NSObject, NSApplicationDelegate {
     var popupWindow: NSPanel { inIsland ? island.panel : panel }
 
     // The island panel stays on screen while compact, so visibility alone does not mean open.
-    var isOpen: Bool { item != nil && openingTask == nil && (inIsland ? island.isExpanded : panel.isVisible) }
+    var isOpen: Bool {
+        if case .open = lifecycle { return true }
+        return false
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         panel.isOpaque = false
@@ -1722,21 +1838,37 @@ final class Popups: NSObject, NSApplicationDelegate {
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.appearance = NSAppearance(named: .darkAqua)
+        panel.acceptsMouseMovedEvents = true
+        island.panel.acceptsMouseMovedEvents = true
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged], handler: { [weak self] _ in
+            self?.pointerMoved()
+        }) { monitors.append(monitor) }
+        if let monitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged], handler: { [weak self] event in
+            self?.pointerMoved()
+            return event
+        }) { monitors.append(monitor) }
         if let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: { [weak self] _ in
-            guard let self, self.isOpen || self.openingTask != nil else { return }
-            // The source item must reach its click script so a second click toggles closed.
-            if self.openingTask != nil {
-                let point = NSEvent.mouseLocation
-                if self.openingHasAnchor {
-                    if !self.anchor.contains(point) { self.close() }
-                } else { self.openingClicks.append(point) }
-            } else if !self.anchor.contains(NSEvent.mouseLocation) { self.close() }
+            guard let self, self.isOpen || self.candidate != nil else { return }
+            self.outsideClick(at: NSEvent.mouseLocation)
+        }) { monitors.append(monitor) }
+        if let monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: { [weak self] event in
+            guard let self, self.lifecycle.target != nil || self.candidate != nil else { return event }
+            let point = NSEvent.mouseLocation
+            if !(self.isOpen && self.popupWindow.frame.contains(point)) { self.outsideClick(at: point) }
+            return event
         }) { monitors.append(monitor) }
         if let monitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
-            if event.keyCode == 53, self?.openingTask != nil { self?.close() }
+            if event.keyCode == 53, let self, self.lifecycle.target != nil || self.candidate != nil {
+                interactionLogger.debug("event=dismiss_reason reason=escape")
+                self.close()
+            }
         }) { monitors.append(monitor) }
         if let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
-            if event.keyCode == 53 { self?.close(); return nil }
+            if event.keyCode == 53, let self, self.lifecycle.target != nil || self.candidate != nil {
+                interactionLogger.debug("event=dismiss_reason reason=escape")
+                self.close()
+                return nil
+            }
             return event
         }) { monitors.append(monitor) }
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(close), name: NSWorkspace.willSleepNotification, object: nil)
@@ -1754,13 +1886,12 @@ final class Popups: NSObject, NSApplicationDelegate {
                 case .volume: self.refreshVolume()
                 case .network: self.refreshNetwork()
                 case .tailscale: if Date().timeIntervalSince(self.tailscaleRead) >= 2 { self.refreshTailscale() }
-                case .media:
-                    self.refreshMedia()
-                    let pointer = NSEvent.mouseLocation
-                    if self.hoverCanClose && !self.anchor.contains(pointer) && !self.popupWindow.frame.contains(pointer) { self.close() }
+                case .media: self.refreshMedia()
                 case .clock:
                     if self.calendarMinute != Int(Date().timeIntervalSince1970 / 60) || self.calendarDirty { self.loadCalendar() }
                 case .system: if self.bar.system != self.systemShown { self.refreshSystem() }
+                case .front: self.refreshFront()
+                case .battery, .workspace, .mode: self.refreshInformation()
                 case nil: break
                 }
             }
@@ -1771,10 +1902,10 @@ final class Popups: NSObject, NSApplicationDelegate {
         bar.start()
         startMediaStream()
         switch initialCommand {
-        case .toggle(let popup): toggle(popup)
-        case .hover: show(.media)
+        case .toggle(let source): show(source)
+        case .hover(let source): show(source)
         case .volumeScroll(let notches): scrollVolume(notches)
-        case .start, .hoverEnd, .stop: break
+        case .geometry, .start, .hoverEnd, .stop: break
         }
     }
 
@@ -1831,6 +1962,9 @@ final class Popups: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         calendarAccessTask?.cancel()
         calendarAccessTask = nil
+        candidateTask?.cancel()
+        candidateTask = nil
+        candidate = nil
         close()
         for task in mediaActionTasks.values { task.cancel() }
         mediaActionTasks.removeAll()
@@ -1854,75 +1988,286 @@ final class Popups: NSObject, NSApplicationDelegate {
     @objc func receive(_ notification: Notification) {
         guard let command = PopupCommand(userInfo: notification.userInfo) else { return }
         switch command {
+        case .hover(let source):
+            interactionLogger.debug("event=received action=hover kind=\(source.kind.rawValue, privacy: .public)")
+        case .toggle(let source):
+            interactionLogger.debug("event=received action=toggle kind=\(source.kind.rawValue, privacy: .public)")
+        case .hoverEnd(let source):
+            interactionLogger.debug("event=received action=hover-end kind=\(source.kind.rawValue, privacy: .public)")
+        default: break
+        }
+        switch command {
         case .stop: NSApp.terminate(nil)
         case .volumeScroll(let notches): scrollVolume(notches)
-        case .hover: show(.media)
-        case .hoverEnd: if item == .media { hoverCanClose = true }
+        case .geometry: geometryChanged()
+        case .hover(let source): show(source)
+        case .hoverEnd(let source):
+            if lifecycle.target?.source.identity == source.identity { pointerMoved() }
+            else if case .dismissed(let identity, _) = lifecycle, identity == source.identity { pointerMoved() }
         case .start: bar.pushAll()
-        case .toggle(let popup): toggle(popup)
+        case .toggle(let source): show(source)
         }
     }
 
-    func islandExited() {
-        guard item == .media, inIsland else { return }
-        hoverCanClose = true
-        if !island.panel.frame.contains(NSEvent.mouseLocation) { close() }
+    func islandExited() { pointerMoved() }
+
+    func outsideClick(at point: NSPoint) {
+        if openingHasAnchor && anchor.contains(point) { return }
+        if candidate != nil {
+            interactionLogger.debug("event=pending_click candidate=\(self.candidate?.id.uuidString ?? "none", privacy: .public)")
+            pendingClick = point
+        } else {
+            interactionLogger.debug("event=dismiss_reason reason=outside_click kind=\(self.item?.rawValue ?? "none", privacy: .public)")
+            close()
+        }
     }
 
-    func queryAnchor(_ item: PopupKind) async -> NSRect? {
-        guard let result = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath), ["--query", item.rawValue]),
-              result.status == 0,
-              let object = try? JSONSerialization.jsonObject(with: result.output) as? [String: Any],
-              let rects = object["bounding_rects"] as? [String: [String: Any]],
-              let rect = rects.sorted(by: { $0.key < $1.key }).first?.value,
-              let origin = rect["origin"] as? [Double], let size = rect["size"] as? [Double],
-              origin.count == 2, size.count == 2,
-              let screen = NSScreen.screens.first else { return nil }
-        return NSRect(x: origin[0], y: screen.frame.maxY - origin[1] - size[1], width: size[0], height: size[1])
+    func geometryChanged() {
+        geometryGeneration += 1
+        geometryTask?.cancel()
+        geometryTask = nil
+        guard let target = lifecycle.target, openingHasAnchor, !inIsland else { return }
+        let generation = geometryGeneration
+        let source: PopupSource
+        switch target.source {
+        case .front, .frontIcon: source = .front
+        case .system, .cpu, .memory: source = .system
+        case .workspace(let id, _): source = .workspace(id, "ws.\(id)")
+        default: source = target.source
+        }
+        geometryTask = Task { [weak self] in
+            guard let self else { return }
+            let rect = await self.queryAnchor(source)
+            guard !Task.isCancelled, self.geometryGeneration == generation,
+                  self.lifecycle.target?.id == target.id else { return }
+            self.geometryTask = nil
+            guard let rect else { return }
+            self.anchor = rect
+            if self.isOpen {
+                let screen = NSScreen.screens.first { $0.frame.intersects(rect) } ?? NSScreen.screens[0]
+                let inset = self.theme.number("POPUP_GAP")
+                let frame = self.panel.frame
+                let x = max(screen.frame.minX + inset, min(rect.midX - frame.width / 2, screen.frame.maxX - inset - frame.width))
+                self.panel.setFrameOrigin(NSPoint(x: x, y: rect.minY - inset - frame.height))
+            }
+            self.pointerMoved()
+        }
     }
 
-    func show(_ next: PopupKind) {
-        if item == next && (isOpen || openingTask != nil) { return }
-        toggle(next)
+    func queryAnchor(_ source: PopupSource) async -> NSRect? {
+        let executable = URL(fileURLWithPath: theme.sketchybarPath)
+        guard let displays = try? await ProcessCapture().run(executable, ["--query", "displays"]),
+              !Task.isCancelled, displays.status == 0,
+              let objects = try? JSONSerialization.jsonObject(with: displays.output) as? [[String: Any]],
+              let display = objects.first(where: { ($0["DirectDisplayID"] as? NSNumber)?.uint32Value == CGMainDisplayID() }),
+              let index = display["arrangement-id"] as? Int, let screen = NSScreen.screens.first else { return nil }
+        let names: [String]
+        switch source {
+        case .system, .cpu, .memory: names = ["system.cpu", "system.memory"]
+        case .front, .frontIcon: names = ["front", "front.icon"]
+        case .workspace(let id, _):
+            guard let bar = try? await ProcessCapture().run(executable, ["--query", "bar"]),
+                  !Task.isCancelled, bar.status == 0,
+                  let object = try? JSONSerialization.jsonObject(with: bar.output) as? [String: Any],
+                  let items = object["items"] as? [String] else { return nil }
+            let base = "ws.\(id)"
+            names = items.filter { $0 == base || ($0.hasPrefix(base + ".a") && $0.dropFirst((base + ".a").count).allSatisfy(\.isNumber)) }
+            guard names.contains(base) else { return nil }
+        default: names = [source.rawValue]
+        }
+        var union: NSRect?
+        var sourceVisible = source == .system
+        for name in names {
+            guard let result = try? await ProcessCapture().run(executable, ["--query", name]),
+                  !Task.isCancelled, result.status == 0,
+                  let object = try? JSONSerialization.jsonObject(with: result.output) as? [String: Any],
+                  let geometry = object["geometry"] as? [String: Any], let drawing = geometry["drawing"] as? String else { return nil }
+            if drawing != "on" {
+                if name == source.rawValue || source.kind == .system || name == "front" || (source.kind == .workspace && name == names.first) { return nil }
+                continue
+            }
+            guard let rects = object["bounding_rects"] as? [String: [String: Any]],
+                  let rect = rects["display-\(index)"],
+                  let origin = rect["origin"] as? [Double], let size = rect["size"] as? [Double],
+                  origin.count == 2, size.count == 2, size[0] > 0, size[1] > 0 else { return nil }
+            if name == source.rawValue { sourceVisible = true }
+            let measured = NSRect(x: origin[0], y: screen.frame.maxY - origin[1] - size[1], width: size[0], height: size[1])
+            guard measured.intersects(screen.frame) else { return nil }
+            union = union.map { $0.union(measured) } ?? measured
+        }
+        return sourceVisible ? union : nil
     }
 
-    func toggle(_ next: PopupKind) {
-        if item == next && (isOpen || openingTask != nil) { close(); return }
-        close()
-        item = next
-        // The island already holds the streamed snapshot, so it opens without waiting for a read.
+    func pointerMoved() {
+        let point = NSEvent.mouseLocation
+        if case .dismissed(_, let bounds) = lifecycle {
+            if let bounds {
+                if !bounds.contains(point) { lifecycle = .closed }
+            } else {
+                suppressionPoints.append(point)
+                if suppressionPoints.count > 4 {
+                    suppressionPoints = [suppressionPoints.min(by: { $0.x < $1.x }), suppressionPoints.max(by: { $0.x < $1.x }),
+                                         suppressionPoints.min(by: { $0.y < $1.y }), suppressionPoints.max(by: { $0.y < $1.y })].compactMap { $0 }
+                }
+            }
+            return
+        }
+        guard lifecycle.target != nil, openingHasAnchor, geometryTask == nil else { return }
+        if anchor.contains(point) { return }
+        if isOpen {
+            let popup = popupWindow.frame
+            if popup.contains(point) { return }
+            let left = max(anchor.minX, popup.minX)
+            let right = min(anchor.maxX, popup.maxX)
+            if right > left {
+                let corridor = NSRect(x: left, y: popup.maxY, width: right - left, height: max(0, anchor.minY - popup.maxY))
+                if corridor.contains(point) { return }
+            }
+        }
+        interactionLogger.debug("event=dismiss_reason reason=pointer_exit kind=\(self.item?.rawValue ?? "none", privacy: .public)")
+        dismiss(suppress: false)
+    }
+
+    func show(_ source: PopupSource) {
+        if lifecycle.target?.source.identity == source.identity {
+            interactionLogger.debug("event=show_ignored reason=already_active kind=\(source.kind.rawValue, privacy: .public)")
+            return
+        }
+        if candidate?.source.identity == source.identity {
+            interactionLogger.debug("event=show_ignored reason=already_candidate kind=\(source.kind.rawValue, privacy: .public)")
+            return
+        }
+        if case .dismissed(let identity, let bounds) = lifecycle, identity == source.identity {
+            guard let bounds else {
+                interactionLogger.debug("event=show_ignored reason=suppressed_pending kind=\(source.kind.rawValue, privacy: .public)")
+                return
+            }
+            if bounds.contains(NSEvent.mouseLocation) {
+                interactionLogger.debug("event=show_ignored reason=suppressed_inside kind=\(source.kind.rawValue, privacy: .public)")
+                return
+            }
+        }
+        if candidate != nil {
+            guard candidateProbes[source.identity] == nil else { return }
+            probeSources[source.identity] = source
+            interactionLogger.debug("event=probe_start kind=\(source.kind.rawValue, privacy: .public) candidate=\(self.candidate?.id.uuidString ?? "none", privacy: .public)")
+            candidateProbes[source.identity] = Task { [weak self] in
+                guard let self else { return }
+                var rect: NSRect?
+                repeat {
+                    let generation = self.geometryGeneration
+                    if source.kind == .media, self.island.notch != nil {
+                        rect = self.island.panel.isVisible ? self.island.panel.frame : nil
+                    } else {
+                        rect = await self.queryAnchor(source)
+                    }
+                    guard !Task.isCancelled else {
+                        interactionLogger.debug("event=probe_cancelled kind=\(source.kind.rawValue, privacy: .public) generation=\(generation)")
+                        return
+                    }
+                    interactionLogger.debug("event=probe_anchor kind=\(source.kind.rawValue, privacy: .public) generation=\(generation) current_generation=\(self.geometryGeneration) found=\(rect != nil) contains=\(rect?.contains(NSEvent.mouseLocation) == true)")
+                    if generation == self.geometryGeneration { break }
+                } while true
+                self.candidateProbes[source.identity] = nil
+                self.probeSources[source.identity] = nil
+                guard let rect, rect.contains(NSEvent.mouseLocation) else {
+                    interactionLogger.debug("event=probe_rejected kind=\(source.kind.rawValue, privacy: .public) reason=anchor_or_pointer")
+                    return
+                }
+                interactionLogger.debug("event=probe_accepted kind=\(source.kind.rawValue, privacy: .public) replaced_candidate=\(self.candidate?.id.uuidString ?? "none", privacy: .public)")
+                self.candidateTask?.cancel()
+                self.candidateTask = nil
+                self.candidate = nil
+                self.pendingClick = nil
+                self.show(source)
+            }
+            return
+        }
+        if case .dismissed(_, nil) = lifecycle { lifecycle = .closed; suppressionPoints.removeAll() }
+        let target = PopupTarget(id: UUID(), source: source)
+        candidate = target
+        interactionLogger.debug("event=candidate_start kind=\(source.kind.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public) generation=\(self.geometryGeneration)")
+        let next = source.kind
         if next == .media, island.notch != nil {
+            guard island.panel.isVisible, island.panel.frame.contains(NSEvent.mouseLocation) else {
+                interactionLogger.debug("event=candidate_rejected kind=media id=\(target.id.uuidString, privacy: .public) reason=island_or_pointer")
+                candidate = nil
+                candidateTask = nil
+                return
+            }
+            interactionLogger.debug("event=candidate_accepted kind=media id=\(target.id.uuidString, privacy: .public)")
+            candidate = nil
+            candidateTask = nil
+            dismiss(suppress: false)
+            lifecycle = .opening(target)
             inIsland = true
             anchor = island.panel.frame
+            openingHasAnchor = true
             media = island.media
             mediaError = nil
             buildMedia()
+            lifecycle = .open(target)
             island.panel.makeKeyAndOrderFront(nil)
+            interactionLogger.debug("event=panel_ordered kind=media id=\(target.id.uuidString, privacy: .public) panel=island")
             return
         }
-        openingHasAnchor = false
-        openingTask = Task { [weak self] in
+        candidateTask = Task { [weak self] in
             guard let self else { return }
-            guard let rect = await self.queryAnchor(next), !Task.isCancelled else {
-                if !Task.isCancelled { self.close() }
+            var rect: NSRect?
+            repeat {
+                let generation = self.geometryGeneration
+                rect = await self.queryAnchor(source)
+                guard !Task.isCancelled, self.candidate?.id == target.id else {
+                    interactionLogger.debug("event=candidate_cancelled kind=\(next.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public) cancelled=\(Task.isCancelled) current=\(self.candidate?.id == target.id)")
+                    return
+                }
+                interactionLogger.debug("event=candidate_anchor kind=\(next.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public) generation=\(generation) current_generation=\(self.geometryGeneration) found=\(rect != nil) contains=\(rect?.contains(NSEvent.mouseLocation) == true)")
+                if generation == self.geometryGeneration { break }
+            } while true
+            if let point = self.pendingClick {
+                self.pendingClick = nil
+                if rect?.contains(point) != true { self.close() }
+            }
+            self.candidate = nil
+            self.candidateTask = nil
+            if case .dismissed(let identity, nil) = self.lifecycle, identity == source.identity {
+                interactionLogger.debug("event=candidate_rejected kind=\(next.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public) reason=suppressed")
+                let exited = rect.map { bounds in self.suppressionPoints.contains { !bounds.contains($0) } } ?? true
+                self.suppressionPoints.removeAll()
+                if let rect, !exited, rect.contains(NSEvent.mouseLocation) {
+                    self.lifecycle = .dismissed(identity, rect)
+                } else {
+                    self.lifecycle = .closed
+                    if let rect, exited, rect.contains(NSEvent.mouseLocation) { self.show(source) }
+                }
                 return
             }
+            guard let rect, rect.contains(NSEvent.mouseLocation) else {
+                interactionLogger.debug("event=candidate_rejected kind=\(next.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public) reason=anchor_or_pointer")
+                if let source = self.probeSources.values.first {
+                    self.candidateProbes[source.identity]?.cancel()
+                    self.candidateProbes[source.identity] = nil
+                    self.probeSources[source.identity] = nil
+                    self.show(source)
+                }
+                return
+            }
+            interactionLogger.debug("event=candidate_accepted kind=\(next.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public)")
+            self.dismiss(suppress: false)
+            self.lifecycle = .opening(target)
             self.anchor = rect
             self.openingHasAnchor = true
-            guard self.openingClicks.allSatisfy({ rect.contains($0) }) else { self.close(); return }
-            self.openingClicks.removeAll()
             switch next {
             case .volume: self.buildVolume()
             case .network:
-                self.networkState = NetworkState.read()
+                self.networkState = readNetworkState(context: "opening")
                 self.buildNetwork()
             case .tailscale:
-                await self.readTailscale()
-                guard !Task.isCancelled else { return }
+                self.tailscale = nil
                 self.buildTailscale()
             case .media:
-                await self.readMedia()
-                guard !Task.isCancelled else { return }
+                self.media = self.streamedMedia
+                self.mediaError = nil
                 self.buildMedia()
             case .clock:
                 self.events = []
@@ -1933,28 +2278,54 @@ final class Popups: NSObject, NSApplicationDelegate {
                 self.processes = ProcessSampler()
                 self.topProcesses = self.processes.sample(count: 3) ?? []
                 self.buildSystem()
+            case .front:
+                self.front = nil
+                self.buildFront()
+            case .battery, .workspace, .mode:
+                self.information = ["Loading"]
+                self.buildInformation()
             }
-            guard !Task.isCancelled else { return }
-            self.openingTask = nil
+            guard !Task.isCancelled, self.lifecycle.target?.id == target.id else {
+                interactionLogger.debug("event=panel_cancelled kind=\(next.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public)")
+                return
+            }
+            self.lifecycle = .open(target)
             self.panel.makeKeyAndOrderFront(nil)
+            interactionLogger.debug("event=panel_ordered kind=\(next.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public) panel=popup")
             if next == .volume { self.panel.makeFirstResponder(self.slider) }
-            if next == .clock { self.loadCalendar(requestAccess: true) }
-            if next == .media && self.hoverCanClose {
-                let pointer = NSEvent.mouseLocation
-                if !self.anchor.contains(pointer) && !self.popupWindow.frame.contains(pointer) { self.close() }
-            }
+            if next == .clock { self.loadCalendar() }
+            if next == .tailscale { self.refreshTailscale() }
+            if next == .media { self.refreshMedia() }
+            if next == .front { self.refreshFront() }
+            if next == .battery || next == .workspace || next == .mode { self.refreshInformation() }
+            self.pointerMoved()
         }
     }
 
-    @objc func close() {
-        openingTask?.cancel()
-        openingTask = nil
-        openingClicks.removeAll()
+    @objc func close() { dismiss(suppress: true) }
+
+    func dismiss(suppress: Bool) {
+        let target = suppress ? (candidate ?? lifecycle.target) : lifecycle.target
+        if let target {
+            interactionLogger.debug("event=dismiss kind=\(target.kind.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public) reason=\(suppress ? "close" : "replacement_or_pointer_exit", privacy: .public) candidate=\(self.candidate?.id.uuidString ?? "none", privacy: .public)")
+        }
+        let bounds: NSRect? = candidate != nil && suppress ? nil : (openingHasAnchor ? anchor : nil)
         openingHasAnchor = false
+        geometryTask?.cancel()
+        geometryTask = nil
+        for task in candidateProbes.values { task.cancel() }
+        candidateProbes.removeAll()
+        probeSources.removeAll()
+        pendingClick = nil
         refreshTask?.cancel()
         refreshTask = nil
-        item = nil
-        hoverCanClose = false
+        if suppress, let target {
+            suppressionPoints = bounds == nil ? [NSEvent.mouseLocation] : []
+            lifecycle = .dismissed(target.source.identity, bounds)
+        } else {
+            suppressionPoints.removeAll()
+            lifecycle = .closed
+        }
         mediaSeeking = false
         pendingMediaSeek = nil
         if inIsland {
@@ -2261,8 +2632,129 @@ final class Popups: NSObject, NSApplicationDelegate {
         _ = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath), ["--trigger", event])
     }
 
+    func readFront() async -> FrontSnapshot? {
+        let paths = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
+        guard let path = paths.map({ "\($0)/aerospace" }).first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
+              let result = try? await ProcessCapture().run(URL(fileURLWithPath: path),
+                  ["list-windows", "--focused", "--json", "--format", "%{app-name} %{window-title}"]),
+              !Task.isCancelled, result.status == 0,
+              let windows = try? JSONDecoder().decode([FrontSnapshot].self, from: result.output) else { return nil }
+        return windows.first
+    }
+
+    func refreshFront() {
+        guard let target = lifecycle.target, target.kind == .front, isOpen, refreshTask == nil else { return }
+        refreshTask = Task { [weak self] in
+            guard let self else { return }
+            let next = await self.readFront()
+            guard !Task.isCancelled, self.lifecycle.target?.id == target.id, self.isOpen else { return }
+            self.refreshTask = nil
+            if self.front != next { self.front = next; self.buildFront() }
+        }
+    }
+
+    func buildFront() {
+        let pad = theme.number("POPUP_PADDING")
+        let width = theme.number("POPUP_WIDTH")
+        let row = theme.number("POPUP_ROW")
+        let view = surface(height: pad * 2 + row * 3)
+        label("Front app", x: pad, y: pad, width: width - pad * 2, in: view)
+        let name = front?.appName.flatMap { $0.isEmpty ? nil : $0 } ?? "Unavailable"
+        let title = front?.windowTitle.flatMap { $0.isEmpty ? nil : $0 } ?? "Window unavailable"
+        label(name, x: pad, y: pad + row, width: width - pad * 2, in: view)
+        label(title, x: pad, y: pad + row * 2, width: width - pad * 2, color: "TEXT2", in: view)
+    }
+
+    func refreshInformation() {
+        guard let target = lifecycle.target, isOpen, refreshTask == nil else { return }
+        refreshTask = Task { [weak self] in
+            guard let self else { return }
+            let next = await self.readInformation(target.source)
+            guard !Task.isCancelled, self.lifecycle.target?.id == target.id, self.isOpen else { return }
+            self.refreshTask = nil
+            if target.kind == .mode, next == nil { self.dismiss(suppress: false); return }
+            let lines = next ?? ["Unavailable"]
+            if self.information != lines { self.information = lines; self.buildInformation() }
+        }
+    }
+
+    func readInformation(_ source: PopupSource) async -> [String]? {
+        let capture = ProcessCapture()
+        if source.kind == .battery {
+            guard let result = try? await capture.run(URL(fileURLWithPath: "/usr/bin/pmset"), ["-g", "batt"]),
+                  !Task.isCancelled, result.status == 0 else { return nil }
+            let output = String(decoding: result.output, as: UTF8.self)
+            let lines = output.components(separatedBy: .newlines)
+            var values: [String] = []
+            if let first = lines.first {
+                if first.contains("AC Power") { values.append("AC Power") }
+                else if first.contains("Battery Power") { values.append("Battery Power") }
+            }
+            let pattern = try? NSRegularExpression(pattern: "([0-9]+)%|([0-9]+:[0-9]{2}) remaining")
+            let range = NSRange(output.startIndex..., in: output)
+            for match in pattern?.matches(in: output, range: range) ?? [] {
+                if let r = Range(match.range, in: output) { values.append(String(output[r])) }
+            }
+            return values.isEmpty ? nil : values
+        }
+        let paths = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
+        guard let path = paths.map({ "\($0)/aerospace" }).first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return nil }
+        let executable = URL(fileURLWithPath: path)
+        if case .workspace(let id, _) = source {
+            guard let result = try? await capture.run(executable, ["list-windows", "--workspace", id, "--json", "--format", "%{app-name}"]),
+                  !Task.isCancelled, result.status == 0,
+                  let windows = try? JSONSerialization.jsonObject(with: result.output) as? [[String: Any]] else { return nil }
+            var counts: [String: Int] = [:]
+            for window in windows {
+                let name = (window["app-name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Unknown app"
+                counts[name, default: 0] += 1
+            }
+            if counts.isEmpty { return ["No windows"] }
+            return counts.keys.sorted().map { "\($0)  \(counts[$0] ?? 0)" }
+        }
+        if source.kind == .mode {
+            guard let current = try? await capture.run(executable, ["list-modes", "--current"]),
+                  !Task.isCancelled, current.status == 0 else { return ["Unavailable"] }
+            let mode = String(decoding: current.output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !mode.isEmpty, mode != "main" else { return nil }
+            guard mode.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95 }),
+                  let result = try? await ProcessCapture().run(executable, ["config", "--get", "mode.\(mode).binding", "--json"]),
+                  !Task.isCancelled, result.status == 0,
+                  let bindings = try? JSONSerialization.jsonObject(with: result.output) as? [String: String] else { return [mode, "Unavailable"] }
+            let safeActions: Set<String> = ["mode main", "resize width -50", "resize width +50", "resize height -50",
+                                            "resize height +50", "balance-sizes", "flatten-workspace-tree",
+                                            "close-all-windows-but-current", "join-with left", "join-with right",
+                                            "join-with up", "join-with down"]
+            return [mode] + bindings.keys.sorted().map { key in
+                let action = bindings[key] ?? ""
+                let commands = action.components(separatedBy: ";").map { $0.trimmingCharacters(in: .whitespaces) }
+                return commands.allSatisfy { safeActions.contains($0) } ? "\(key)  \(action)" : key
+            }
+        }
+        return nil
+    }
+
+    func buildInformation() {
+        guard let source = lifecycle.target?.source else { return }
+        let title: String
+        switch source {
+        case .battery: title = "Battery"
+        case .workspace(let id, _): title = "Workspace \(id)"
+        case .mode: title = "Mode"
+        default: return
+        }
+        let pad = theme.number("POPUP_PADDING")
+        let width = theme.number("POPUP_WIDTH")
+        let row = theme.number("POPUP_ROW")
+        let view = surface(height: pad * 2 + row * CGFloat(1 + information.count))
+        label(title, x: pad, y: pad, width: width - pad * 2, in: view)
+        for (index, line) in information.enumerated() {
+            label(line, x: pad, y: pad + row * CGFloat(index + 1), width: width - pad * 2, color: "TEXT2", in: view)
+        }
+    }
+
     func refreshNetwork() {
-        let state = NetworkState.read()
+        let state = readNetworkState(context: "refresh")
         if state != networkState {
             networkState = state
             buildNetwork()
@@ -2722,30 +3214,32 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
     }
 
-    func loadCalendar(requestAccess: Bool = false) {
+    @objc func requestCalendarAccess() {
+        guard !calendarBusy, EKEventStore.authorizationStatus(for: .event) == .notDetermined else { return }
+        calendarBusy = true
+        buildCalendar()
+        // A permission request belongs to the app, not the currently open popup.
+        calendarAccessTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await self.eventStore.requestFullAccessToEvents()
+                guard !Task.isCancelled else { return }
+                self.calendarError = nil
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.calendarError = error
+            }
+            self.calendarBusy = false
+            self.calendarAccessTask = nil
+            // The user may have switched or closed popups while permission was pending.
+            self.calendarDirty = true
+            if self.item == .clock && self.isOpen { self.loadCalendar() }
+        }
+    }
+
+    func loadCalendar() {
         guard !calendarBusy else { return }
         let authorization = EKEventStore.authorizationStatus(for: .event)
-        if authorization == .notDetermined && requestAccess {
-            calendarBusy = true
-            buildCalendar()
-            // A permission request belongs to the app, not the currently open popup.
-            calendarAccessTask = Task { [weak self] in
-                guard let self else { return }
-                do {
-                    _ = try await self.eventStore.requestFullAccessToEvents()
-                    self.calendarError = nil
-                } catch {
-                    self.calendarError = error
-                }
-                self.calendarBusy = false
-                self.calendarAccessTask = nil
-                guard !Task.isCancelled else { return }
-                // The user may have switched or closed popups while permission was pending.
-                self.calendarDirty = true
-                if self.item == .clock && self.isOpen { self.loadCalendar() }
-            }
-            return
-        }
         calendarMinute = Int(Date().timeIntervalSince1970 / 60)
         calendarDirty = false
         guard authorization == .fullAccess else {
@@ -2838,7 +3332,9 @@ final class Popups: NSObject, NSApplicationDelegate {
             message.textColor = theme.color("TEXT2")
             message.frame = NSRect(x: pad, y: eventsY + row, width: width - pad * 2, height: row * 2)
             view.addSubview(message)
-            let button = NSButton(title: "Calendar", target: self, action: #selector(openCalendarPrivacy))
+            let canRequest = EKEventStore.authorizationStatus(for: .event) == .notDetermined
+            let button = NSButton(title: canRequest ? "Allow calendar access" : "Calendar", target: self,
+                                  action: canRequest ? #selector(requestCalendarAccess) : #selector(openCalendarPrivacy))
             button.frame = NSRect(x: pad, y: eventsY + row * 3, width: width - pad * 2, height: row)
             button.bezelStyle = .inline
             button.font = theme.font
@@ -2925,14 +3421,14 @@ if arguments.count > 2 && arguments[1] == "volume-scroll" {
     let size = Notch.main.map { ["width": Int($0.width.rounded()), "height": Int($0.height.rounded())] }
     let data = try JSONEncoder().encode(size)
     print(String(decoding: data, as: UTF8.self))
-} else if arguments.count > 1 && arguments[1] == PopupCommand.hoverEnd.rawValue {
-    PopupCommand.hoverEnd.post()
 } else if arguments.count > 2 && arguments[1] == "media" {
     guard let action = MediaAction(rawValue: arguments[2]) else {
         logger.error("Unknown media command: \(arguments[2])")
         exit(EXIT_FAILURE)
     }
     runCLI { try await Media.perform(action) }
+} else if arguments.count > 1 && arguments[1] == PopupCommand.geometry.rawValue {
+    PopupCommand.geometry.post()
 } else if arguments.count > 1 && arguments[1] == PopupCommand.stop.rawValue {
     PopupCommand.stop.post()
     // sketchybarrc starts a helper right after this. Wait up to 2 s for the running one to
@@ -2946,7 +3442,7 @@ if arguments.count > 2 && arguments[1] == "volume-scroll" {
     }
 } else {
     let raw = arguments.count > 1 ? arguments[1] : PopupKind.volume.rawValue
-    guard let command = PopupCommand(raw) else {
+    guard let command = PopupCommand(raw, argument: arguments.count > 2 ? arguments[2] : nil) else {
         logger.error("Unknown popup command: \(raw)")
         exit(EXIT_FAILURE)
     }

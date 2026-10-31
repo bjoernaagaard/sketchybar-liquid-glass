@@ -30,4 +30,5 @@ export ISLAND_WING ISLAND_RADIUS ISLAND_RESPONSE
 export SB="$(command -v "$SB")"
 # macOS pgrep excludes ancestors by default. A bar click runs under SketchyBar.
 export POPUP_BAR_PID="$(/usr/bin/pgrep -a -x -u "$UID" sketchybar)"
-"$HELPER" "${1:-$NAME}" </dev/null >/dev/null 2>&1 &
+[ "$#" -gt 0 ] || set -- "$NAME"
+"$HELPER" "$@" </dev/null >/dev/null 2>&1 &

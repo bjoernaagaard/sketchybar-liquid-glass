@@ -30,6 +30,7 @@ if [ -n "$workspaces" ]; then
 fi
 order=()
 for ws in $workspaces; do
+  case "$ws" in *[!a-zA-Z0-9_-]*|'') continue ;; esac
   members=("ws.$ws")
   for ((i = 0; i < MAX_APPS; i++)); do members+=("ws.$ws.a$i"); done
   members+=("ws.$ws.end")
@@ -45,11 +46,13 @@ for ws in $workspaces; do
   [[ $bar == *"\"ws.$ws\""* ]] && continue
   add+=(--add item "ws.$ws" left
         --set "ws.$ws" label="$ws" label.color=$TEXT3 label.padding_left=8 label.padding_right=8
-                       background.drawing=off click_script="aerospace workspace $ws")
+                       background.drawing=off script="$CONFIG_DIR/plugins/hover.sh" click_script="aerospace workspace $ws"
+        --subscribe "ws.$ws" mouse.entered mouse.exited)
   for ((i = 0; i < MAX_APPS; i++)); do
     add+=(--add item "ws.$ws.a$i" left
           --set "ws.$ws.a$i" drawing=off width=0 background.drawing=on
-                             background.image.scale=$ICON_SCALE click_script="aerospace workspace $ws")
+                             background.image.scale=$ICON_SCALE script="$CONFIG_DIR/plugins/hover.sh" click_script="aerospace workspace $ws"
+          --subscribe "ws.$ws.a$i" mouse.entered mouse.exited)
   done
   add+=(--add item "ws.$ws.end" left --set "ws.$ws.end" width=0
         --add bracket "ws.$ws.pill" "${members[@]}"
@@ -66,6 +69,7 @@ colors=()
 collapsing=()
 
 for ws in $workspaces; do
+  case "$ws" in *[!a-zA-Z0-9_-]*|'') continue ;; esac
   apps=()
   while IFS='|' read -r window_ws id; do
     [ "$window_ws" = "$ws" ] && [ -n "$id" ] || continue
@@ -113,12 +117,14 @@ fi
 $SB "${now[@]}"
 $SB "${SIZE_ANIM[@]}" "${sizes[@]}"
 $SB "${COLOR_ANIM[@]}" "${colors[@]}"
+[ ! -x "$CONFIG_DIR/plugins/.popup-helper" ] || "$CONFIG_DIR/plugins/.popup-helper" geometry
 
 # A width-0 item still widens its pill by 2 pt, so hide each one once it has finished
 # collapsing. One that a newer switch is growing again has width above 0 and stays.
-[ ${#collapsing[@]} -gt 0 ] && {
-  sleep 0.3
+{
+  [ ${#SIZE_ANIM[@]} -eq 0 ] || sleep 0.3
   for item in "${collapsing[@]}"; do
     [ "$($SB --query "$item" | jq '.geometry.width')" = 0 ] && $SB --set "$item" drawing=off
   done
+  [ ! -x "$CONFIG_DIR/plugins/.popup-helper" ] || "$CONFIG_DIR/plugins/.popup-helper" geometry
 } &

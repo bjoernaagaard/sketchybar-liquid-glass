@@ -1,14 +1,10 @@
 #!/bin/bash
-if [ "$NAME" = media ]; then
-  case "$SENDER" in
-    mouse.entered) "$CONFIG_DIR/plugins/popup.sh" media-hover ;;
-    mouse.exited)  "$CONFIG_DIR/plugins/popup.sh" media-hover-end ;;
-  esac
-fi
 case "$SENDER" in
   mouse.entered|mouse.exited) exec "$CONFIG_DIR/plugins/hover.sh" ;;
 esac
 source "$CONFIG_DIR/theme.sh"
+# Status updates can change widths and shift other anchors on the same side of the bar.
+trap '[ ! -x "$CONFIG_DIR/plugins/.popup-helper" ] || "$CONFIG_DIR/plugins/.popup-helper" geometry' EXIT
 
 case "$NAME" in
   mode)
