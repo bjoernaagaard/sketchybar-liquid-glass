@@ -817,8 +817,8 @@ final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
-// The island's black shape. The strip as tall as the notch sits on the black bar, so only
-// the part below the bar shows: concave fillets where it leaves the bar, then round corners.
+// The island's black shape hangs from the top edge of the screen between the bar's two pills:
+// concave fillets where it leaves the edge, then round corners.
 final class IslandView: NSView {
     var stripHeight: CGFloat = 0
     // Artwork and meter beside the notch. Other subviews hang below the strip.
@@ -856,22 +856,17 @@ final class IslandView: NSView {
             view.setFrameOrigin(NSPoint(x: ((size.width - view.frame.width) / 2).rounded(), y: size.height - top - view.frame.height))
         }
         let path = CGMutablePath()
-        let width = size.width, height = size.height, junction = height - stripHeight
-        if junction < 0.5 {
-            path.addRect(CGRect(origin: .zero, size: size))
-        } else {
-            let curve = min(fillet, junction / 2)
-            let corner = max(0, min(radius, junction - curve, (width - fillet * 2) / 2))
-            path.move(to: CGPoint(x: 0, y: height))
-            path.addLine(to: CGPoint(x: width, y: height))
-            path.addLine(to: CGPoint(x: width, y: junction))
-            path.addQuadCurve(to: CGPoint(x: width - fillet, y: junction - curve), control: CGPoint(x: width - fillet, y: junction))
-            path.addArc(tangent1End: CGPoint(x: width - fillet, y: 0), tangent2End: CGPoint(x: fillet, y: 0), radius: corner)
-            path.addArc(tangent1End: CGPoint(x: fillet, y: 0), tangent2End: CGPoint(x: fillet, y: junction), radius: corner)
-            path.addLine(to: CGPoint(x: fillet, y: junction - curve))
-            path.addQuadCurve(to: CGPoint(x: 0, y: junction), control: CGPoint(x: fillet, y: junction))
-            path.closeSubpath()
-        }
+        let width = size.width, height = size.height
+        let curve = min(fillet, height / 2)
+        let corner = max(0, min(radius, height - curve, (width - fillet * 2) / 2))
+        path.move(to: CGPoint(x: 0, y: height))
+        path.addLine(to: CGPoint(x: width, y: height))
+        path.addQuadCurve(to: CGPoint(x: width - fillet, y: height - curve), control: CGPoint(x: width - fillet, y: height))
+        path.addArc(tangent1End: CGPoint(x: width - fillet, y: 0), tangent2End: CGPoint(x: fillet, y: 0), radius: corner)
+        path.addArc(tangent1End: CGPoint(x: fillet, y: 0), tangent2End: CGPoint(x: fillet, y: height), radius: corner)
+        path.addLine(to: CGPoint(x: fillet, y: height - curve))
+        path.addQuadCurve(to: CGPoint(x: 0, y: height), control: CGPoint(x: fillet, y: height))
+        path.closeSubpath()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         shape.path = path

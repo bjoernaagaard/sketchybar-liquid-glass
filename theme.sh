@@ -32,10 +32,13 @@ NUM_GAP=4        # number to first icon: 4 + 2 = 6 pt
 PILL_END=6       # last icon to pill edge: 2 + 6 = 8 pt, the same as pill edge to number
 MAX_APPS=4
 
-# Bar layouts. notch.sh picks one for the main display. A notched display gets a flush bar in
-# the color of the camera housing, so the notch and the island that grows out of it read as one shape.
-BAR_FLOAT=(height=30 margin=8 y_offset=8 corner_radius=12 color=$BAR_COLOR border_width=1 shadow=on padding_left=4 padding_right=4)
-BAR_NOTCH=(margin=0 y_offset=0 corner_radius=0 color=$ISLAND_COLOR border_width=0 shadow=off padding_left=12 padding_right=12)
+# Bar layouts. notch.sh picks one for the main display. On a notched display the bar is clear and
+# its two halves become pills beside the camera housing, so the island can grow out of the notch
+# between them. The half.*.start and half.*.end items supply the 4 pt inner padding in both layouts.
+BAR_FLOAT=(color=$BAR_COLOR border_width=1)
+BAR_NOTCH=(color=$CLEAR border_width=0)
+PILL_STYLE=(background.color=$BAR_COLOR background.border_color=$BAR_EDGE background.border_width=1
+            background.corner_radius=12 background.height=30)
 
 # Dynamic Island: wing width beside the notch, open corner radius, and spring response in seconds.
 ISLAND_WING=36

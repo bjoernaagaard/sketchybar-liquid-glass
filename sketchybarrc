@@ -10,7 +10,8 @@ rmdir "${TMPDIR:-/tmp}/sketchybar-spaces-retry" 2>/dev/null
 "$PLUGIN_DIR/popup.sh" build || exit 1
 
 # notch.sh switches to BAR_NOTCH when the main display has a camera housing.
-a=(--bar position=top "${BAR_FLOAT[@]}" border_color=$BAR_EDGE blur_radius=0 display=main topmost=window)
+a=(--bar position=top height=30 margin=8 y_offset=8 corner_radius=12 shadow=on padding_left=0 padding_right=0
+    "${BAR_FLOAT[@]}" border_color=$BAR_EDGE blur_radius=0 display=main topmost=window)
 
 a+=(--default updates=when_shown
     icon.font="$FONT:Medium:13.0" label.font="$FONT:Semibold:13.0"
@@ -32,7 +33,10 @@ a+=(--add event aerospace_workspace_change
 gap() { a+=(--add item "$1" left --set "$1" width=$2); }
 
 # AeroSpace can start after SketchyBar at login, so spaces.sh builds the workspace pills before mode.
-a+=(--add item mode left
+a+=(--add item half.left.start left
+    --set half.left.start width=4
+
+    --add item mode left
     --set mode drawing=off updates=on padding_left=2 label.color=$TEXT label.padding_left=8 label.padding_right=8
                background.drawing=on background.color=$PILL script="$PLUGIN_DIR/status.sh"
     --subscribe mode aerospace_mode_change)
@@ -51,12 +55,21 @@ a+=(--add item spaces left
 
     --add item front left
     --set front label.padding_left=4 label.padding_right=8 script="$PLUGIN_DIR/hover.sh"
-    --subscribe front mouse.entered mouse.exited)
+    --subscribe front mouse.entered mouse.exited
+
+    --add item half.left.end left
+    --set half.left.end width=4
+
+    --add bracket half.left half.left.start half.left.end
+    --set half.left "${PILL_STYLE[@]}" background.drawing=off)
 
 # right side is added right to left
 # The resident helper pushes volume, media, network, tailscale, and system with <item>_state events.
 # updates=on keeps a push from being dropped while an item is not shown.
-a+=(--add item clock right
+a+=(--add item half.right.end right
+    --set half.right.end width=4
+
+    --add item clock right
     --set clock icon.color=$TEXT2 icon.font="$FONT:Medium:13.0" icon.padding_left=8 icon.padding_right=6 label.padding_right=8
                 update_freq=10 script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh clock"
     --subscribe clock system_woke mouse.entered mouse.exited
@@ -101,7 +114,13 @@ a+=(--add item clock right
     --subscribe system.cpu system_state mouse.entered mouse.exited
 
     --add bracket system system.cpu system.memory
-    --set system background.color=$CLEAR background.height=22 background.corner_radius=8)
+    --set system background.color=$CLEAR background.height=22 background.corner_radius=8
+
+    --add item half.right.start right
+    --set half.right.start width=4
+
+    --add bracket half.right half.right.start half.right.end
+    --set half.right "${PILL_STYLE[@]}" background.drawing=off)
 
 $SB "${a[@]}"
 # The resident helper draws the island on a notched display and reports display changes.
