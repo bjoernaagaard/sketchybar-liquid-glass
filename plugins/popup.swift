@@ -99,6 +99,7 @@ enum PopupLifecycle {
 // Commands for the running helper. Strings exist only at the shell and notification boundary.
 enum PopupCommand {
     case toggle(PopupSource), hover(PopupSource), hoverEnd(PopupSource), geometry, start, stop, volumeScroll(notches: Int)
+    case media(MediaAction)
 
     init?(_ raw: String, argument: String? = nil) {
         switch raw {
@@ -113,6 +114,7 @@ enum PopupCommand {
         case "start": self = .start
         case "stop": self = .stop
         default:
+            if let action = MediaAction(command: raw) { self = .media(action); return }
             guard let popup = PopupSource(rawValue: raw) else { return nil }
             self = .toggle(popup)
         }
@@ -127,6 +129,7 @@ enum PopupCommand {
         case .start: "start"
         case .stop: "stop"
         case .volumeScroll: "volume-scroll"
+        case .media(let action): action.command
         }
     }
 
@@ -134,7 +137,7 @@ enum PopupCommand {
         switch self {
         case .volumeScroll(let notches): ["item": rawValue, "argument": String(notches)]
         case .hover(let source), .hoverEnd(let source): ["item": rawValue, "argument": source.rawValue]
-        case .toggle, .geometry, .start, .stop: ["item": rawValue]
+        case .toggle, .geometry, .start, .stop, .media: ["item": rawValue]
         }
     }
 
@@ -290,8 +293,22 @@ enum MediaError: LocalizedError {
     }
 }
 
-enum MediaAction: String {
+enum MediaAction: String, CaseIterable {
     case playPause = "play-pause", next, previous
+
+    // The bar controls call popup.sh with these names. They cross the shell boundary only here.
+    var command: String {
+        switch self {
+        case .playPause: "media-toggle"
+        case .next: "media-next"
+        case .previous: "media-previous"
+        }
+    }
+
+    init?(command: String) {
+        guard let action = Self.allCases.first(where: { $0.command == command }) else { return nil }
+        self = action
+    }
 
     var argument: String {
         switch self {
@@ -802,7 +819,7 @@ struct Theme {
         guard let pid = Int32(try required("POPUP_BAR_PID")), pid > 0 else { throw ConfigurationError.invalidValue("POPUP_BAR_PID") }
         barPID = pid
         var numbers: [String: CGFloat] = [:]
-        for name in ["POPUP_RADIUS", "POPUP_WIDTH", "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE", "ISLAND_GAP"] {
+        for name in ["POPUP_RADIUS", "POPUP_WIDTH", "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE", "ISLAND_GAP", "PROGRESS_INSET"] {
             guard let value = Double(try required(name)), value.isFinite, value >= 0 else { throw ConfigurationError.invalidValue(name) }
             numbers[name] = CGFloat(value)
         }
@@ -916,9 +933,13 @@ enum MediaDisplay: Equatable {
 // to the far end of the bar, and a fit based on its position could never shrink it back.
 struct MediaLayout {
     let leftEdge: Double       // half.left right edge
-    let rightEdge: Double      // where the media item must end: notch.gap, less the island's end padding and volume
+    let rightEdge: Double      // where the media item must end: the left edge of media.prev, the control nearest it
+    let islandEnd: Double      // island.media.end right edge, which SketchyBar pins at notch.gap
     let startWidth: Double     // island.media.start, the island's padding before the media item
     let reserved: Double       // icon padding, glyph, and label padding: what the title cannot use
+
+    // The island runs from the gap after the left island to its pinned end, once the fit has settled.
+    func islandWidth(gap: Double) -> Double { islandEnd - (leftEdge + gap) }
 }
 
 // The media item's width and title. The island's right edge is pinned by SketchyBar, so the item
@@ -1334,6 +1355,7 @@ enum BarState: Equatable {
     case network(NetworkKind)
     case media(label: String, width: Int, playing: Bool)
     case mediaUnavailable(label: String, width: Int)
+    case mediaProgress(Int)
     case tailscale(TailscaleKind)
     case system(cpu: Int, memory: Int, cpuStrain: Strain, memoryStrain: Strain, diskStrain: Strain)
 
@@ -1343,6 +1365,7 @@ enum BarState: Equatable {
         case .volume: "volume_state"
         case .network: "network_state"
         case .media, .mediaUnavailable: "media_state"
+        case .mediaProgress: "media_progress"
         case .tailscale: "tailscale_state"
         case .system: "system_state"
         }
@@ -1354,6 +1377,7 @@ enum BarState: Equatable {
         case .network(let kind): ["KIND=\(kind.rawValue)"]
         case .media(let label, let width, let playing): ["MEDIA=\(playing ? "playing" : "paused")", "LABEL=\(label)", "WIDTH=\(width)"]
         case .mediaUnavailable(let label, let width): ["MEDIA=unavailable", "LABEL=\(label)", "WIDTH=\(width)"]
+        case .mediaProgress(let width): ["WIDTH=\(width)"]
         case .tailscale(let kind): ["KIND=\(kind.rawValue)"]
         case .system(let cpu, let memory, let cpuStrain, let memoryStrain, let diskStrain):
             ["CPU=\(cpu)", "MEM=\(memory)", "CPU_LEVEL=\(cpuStrain.rawValue)", "MEM_LEVEL=\(memoryStrain.rawValue)",
@@ -1537,6 +1561,9 @@ final class Popups: NSObject, NSApplicationDelegate {
     // What the bar item shows, and the one task that fits it. A new fit replaces a pending one.
     var mediaDisplay: MediaDisplay?
     var mediaFitTask: Task<Void, Never>?
+    // The island width the last fit aims for, and the loop that moves the progress plate while a track plays.
+    var mediaIslandWidth: Double?
+    var mediaProgressLoop: Task<Void, Never>?
     // The system popup shows the bar's latest sample and adds GPU and top processes while open.
     var systemShown: SystemSample?
     var processes = ProcessSampler()
@@ -1627,6 +1654,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         case .toggle(let source): show(source)
         case .hover(let source): show(source)
         case .volumeScroll(let notches): scrollVolume(notches)
+        case .media(let action): performMedia(action)
         case .geometry, .start, .hoverEnd, .stop: break
         }
     }
@@ -1677,6 +1705,33 @@ final class Popups: NSObject, NSApplicationDelegate {
     func showMedia(_ display: MediaDisplay) {
         mediaDisplay = display
         fitMedia()
+        syncMediaProgress()
+    }
+
+    // The plate fills the island, less the inset on each side, in proportion to the elapsed time. The stream
+    // reports pauses, seeks, and track changes, which push at once. While a timed track plays, a loop pushes
+    // every 2 s. `publish` skips a width the bar already has.
+    func pushMediaProgress() {
+        guard case .track? = mediaDisplay, let timing = streamedMedia?.timing, let island = mediaIslandWidth else {
+            bar.publish(.mediaProgress(0))
+            return
+        }
+        let track = island - 2 * Double(theme.number("PROGRESS_INSET"))
+        bar.publish(.mediaProgress(max(0, Int((track * timing.elapsed / timing.duration).rounded(.down)))))
+    }
+
+    func syncMediaProgress() {
+        pushMediaProgress()
+        mediaProgressLoop?.cancel()
+        mediaProgressLoop = nil
+        guard case .track(_, _, true)? = mediaDisplay, streamedMedia?.timing != nil else { return }
+        mediaProgressLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, let self else { return }
+                self.pushMediaProgress()
+            }
+        }
     }
 
     // Measures the gap between the left island and the media island, then pushes the width and title that
@@ -1688,8 +1743,11 @@ final class Popups: NSObject, NSApplicationDelegate {
             if delay > .zero { try? await Task.sleep(for: delay) }
             guard !Task.isCancelled, let layout = await self?.mediaLayout(), !Task.isCancelled, let self,
                   let display = self.mediaDisplay else { return }
-            let fit = MediaFit(text: display.text, layout: layout, gap: Double(self.theme.number("ISLAND_GAP")), font: self.theme.font)
+            let gap = Double(self.theme.number("ISLAND_GAP"))
+            let fit = MediaFit(text: display.text, layout: layout, gap: gap, font: self.theme.font)
+            self.mediaIslandWidth = layout.islandWidth(gap: gap)
             self.bar.publish(display.state(fit))
+            self.pushMediaProgress()
         }
     }
 
@@ -1701,15 +1759,18 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func mediaLayout() async -> MediaLayout? {
         guard let index = await barDisplayIndex(),
-              let left = await queryItem("half.left"), let volume = await queryItem("volume"),
-              let start = await queryItem("island.media.start"), let media = await queryItem("media"),
-              !Task.isCancelled,
-              let leftBounds = left.bounds(display: index), let volumeBounds = volume.bounds(display: index),
-              let startBounds = start.bounds(display: index), let icon = media.icon, let label = media.label else { return nil }
-        // q items fill leftward from the notch: notch.gap, island.media.end, volume, then media. So volume's
-        // left edge is where media must end, whatever media's width is now.
+              let left = await queryItem("half.left"), let prev = await queryItem("media.prev"),
+              let start = await queryItem("island.media.start"), let end = await queryItem("island.media.end"),
+              let media = await queryItem("media"), !Task.isCancelled,
+              let leftBounds = left.bounds(display: index), let prevBounds = prev.bounds(display: index),
+              let startBounds = start.bounds(display: index), let endBounds = end.bounds(display: index),
+              let icon = media.icon, let label = media.label else { return nil }
+        // q items fill leftward from the notch: notch.gap, island.media.end, volume, media.next, media.toggle,
+        // media.prev, then media. So media.prev's left edge is where media must end, whatever media's width is
+        // now. Measure only items nearer the notch than media.
         let glyph = (icon.value as NSString).size(withAttributes: [.font: theme.iconFont]).width.rounded(.up)
-        return MediaLayout(leftEdge: leftBounds.minX + leftBounds.width, rightEdge: volumeBounds.minX, startWidth: startBounds.width,
+        return MediaLayout(leftEdge: leftBounds.minX + leftBounds.width, rightEdge: prevBounds.minX,
+                           islandEnd: endBounds.minX + endBounds.width, startWidth: startBounds.width,
                            reserved: icon.paddingLeft + Double(glyph) + icon.paddingRight + label.paddingLeft + label.paddingRight)
     }
 
@@ -1745,6 +1806,8 @@ final class Popups: NSObject, NSApplicationDelegate {
         notchTask = nil
         mediaFitTask?.cancel()
         mediaFitTask = nil
+        mediaProgressLoop?.cancel()
+        mediaProgressLoop = nil
         mediaStream?.cancel()
         mediaStream = nil
         bar.stop()
@@ -1780,6 +1843,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             bar.pushAll()
             fitMedia()
         case .toggle(let source): show(source)
+        case .media(let action): performMedia(action)
         }
     }
 
@@ -2359,6 +2423,8 @@ final class Popups: NSObject, NSApplicationDelegate {
             do {
                 try await Media.perform(action)
             } catch {
+                // The bar controls run with the popup closed, so the log is the only record then.
+                logger.error("Media \(action.argument, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
                 guard !Task.isCancelled, self.item == .media, self.isOpen else { return }
                 NSAlert(error: error).beginSheetModal(for: self.panel, completionHandler: nil)
             }

@@ -28,6 +28,7 @@ a+=(--add event aerospace_workspace_change
     --add event volume_state
     --add event network_state
     --add event media_state
+    --add event media_progress
     --add event tailscale_state
     --add event system_state)
 
@@ -63,7 +64,16 @@ a+=(--add item spaces left
     --set half.left.end width=4
 
     --add bracket half.left half.left.start half.left.end
-    --set half.left "${PILL_STYLE[@]}")
+    --set half.left "${PILL_STYLE[@]}"
+
+    # The progress plate has no footprint: padding_left puts it ISLAND_GAP + PROGRESS_INSET after the left
+    # island, where the media island starts plus its inset. status.sh sets label.width to the plate's width
+    # and padding_right to cancel both, so the left island and the media island never see it.
+    --add item media.progress left
+    --set media.progress drawing=off updates=on padding_left=$((ISLAND_GAP + PROGRESS_INSET)) label.width=0
+                         background.drawing=on background.color=$PROGRESS background.height=$PROGRESS_HEIGHT
+                         background.corner_radius=$PROGRESS_RADIUS script="$PLUGIN_DIR/status.sh"
+    --subscribe media.progress media_progress)
 
 # right side is added right to left
 # The resident helper pushes volume, media, network, tailscale, and system with <item>_state events.
@@ -127,6 +137,21 @@ a+=(--add item notch.gap q
                  label.width=$VOLUME_LABEL_WIDTH
                  updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh volume"
     --subscribe volume volume_state mouse.scrolled mouse.entered mouse.exited
+
+    --add item media.next q
+    --set media.next icon.width=$MEDIA_CONTROL_WIDTH icon.align=center script="$PLUGIN_DIR/hover.sh"
+                     click_script="$PLUGIN_DIR/popup.sh media-next"
+    --subscribe media.next mouse.entered mouse.exited
+
+    --add item media.toggle q
+    --set media.toggle icon.width=$MEDIA_CONTROL_WIDTH icon.align=center script="$PLUGIN_DIR/hover.sh"
+                       click_script="$PLUGIN_DIR/popup.sh media-toggle"
+    --subscribe media.toggle mouse.entered mouse.exited
+
+    --add item media.prev q
+    --set media.prev icon.width=$MEDIA_CONTROL_WIDTH icon.align=center script="$PLUGIN_DIR/hover.sh"
+                     click_script="$PLUGIN_DIR/popup.sh media-previous"
+    --subscribe media.prev mouse.entered mouse.exited
 
     --add item media q
     --set media icon.padding_left=8 icon.padding_right=6 label.padding_right=8

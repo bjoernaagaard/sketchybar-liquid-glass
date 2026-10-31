@@ -7,6 +7,8 @@ TEXT2=0x9effffff
 TEXT3=0x57ffffff
 PILL=0x21ffffff
 HOVER=0x12ffffff
+# The media progress plate: white at low opacity, so it reads as glass and not as a hue.
+PROGRESS=0x14ffffff
 CLEAR=0x00ffffff
 BAR_COLOR=0xe61e2023
 BAR_EDGE=0x1fffffff
@@ -43,6 +45,16 @@ VOLUME_LABEL_WIDTH=44
 
 # The media island ends this far from the left island and from the notch.
 ISLAND_GAP=5
+
+# The media controls are fixed cells, so the fit stays stable. The widest glyph (backward.fill and forward.fill,
+# SF Pro Medium 13) advances 19.1 pt.
+MEDIA_CONTROL_WIDTH=28
+
+# The progress plate sits PROGRESS_INSET inside the island, on every side. Its corners are concentric with
+# the island's 12 pt corners, and shrink to half the width while the plate is narrower than two radii.
+PROGRESS_INSET=2
+PROGRESS_HEIGHT=26
+PROGRESS_RADIUS=10
 
 # Native popups share the bar material without blur or size animation.
 POPUP_RADIUS=12

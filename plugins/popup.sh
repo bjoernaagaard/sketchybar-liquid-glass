@@ -25,7 +25,7 @@ fi
 [ "$1" = volume ] && [ "$BUTTON" = right ] && exec "$HELPER" mute-toggle
 
 export CONFIG_DIR TEXT TEXT2 TEXT3 BAR_COLOR BAR_EDGE WARN CRIT
-export POPUP_RADIUS POPUP_WIDTH POPUP_GAP POPUP_PADDING POPUP_ROW CALENDAR_TODAY_SIZE ISLAND_GAP
+export POPUP_RADIUS POPUP_WIDTH POPUP_GAP POPUP_PADDING POPUP_ROW CALENDAR_TODAY_SIZE ISLAND_GAP PROGRESS_INSET
 export SB="$(command -v "$SB")"
 # macOS pgrep excludes ancestors by default. A bar click runs under SketchyBar.
 export POPUP_BAR_PID="$(/usr/bin/pgrep -a -x -u "$UID" sketchybar)"

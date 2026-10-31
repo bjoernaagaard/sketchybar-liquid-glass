@@ -50,15 +50,32 @@ case "$NAME" in
     # The resident helper pushes MEDIA, LABEL, and WIDTH. It fits the label to the media item, and the
     # item to the gap between the left island and the notch.
     [ "$SENDER" = media_state ] || exit 0
-    if [ "$MEDIA" = unavailable ]; then
-      # SF Pro music.note U+10046A, verified in SF-Pro.ttf as glyph 15101.
-      icon=$'\xf4\x80\x91\xaa'; color=$TEXT3
-    # SF Pro pause.fill U+100286 and play.fill U+100284, verified in SF-Pro.ttf.
-    elif [ "$MEDIA" = playing ]; then icon=$'\xf4\x80\x8a\x86'; color=$TEXT
-    else icon=$'\xf4\x80\x8a\x84'; color=$TEXT2; fi
+    # The media item shows a note, and media.toggle shows the play state.
+    # SF Pro music.note U+10046A, verified in SF-Pro.ttf as glyph 15101.
+    # SF Pro play.fill U+100284 and pause.fill U+100286, verified in SF-Pro.ttf as glyphs 14741 and 14783.
+    # SF Pro backward.fill U+10028A and forward.fill U+10028C, verified in SF-Pro.ttf as glyphs 14831 and 14843.
+    if [ "$MEDIA" = unavailable ]; then note=$TEXT3; toggle=$'\xf4\x80\x8a\x84'; toggle_color=$TEXT3; skip=$TEXT3
+    elif [ "$MEDIA" = playing ]; then note=$TEXT2; toggle=$'\xf4\x80\x8a\x86'; toggle_color=$TEXT; skip=$TEXT2
+    else note=$TEXT3; toggle=$'\xf4\x80\x8a\x84'; toggle_color=$TEXT2; skip=$TEXT2; fi
     honor_reduce_motion
-    $SB "${COLOR_ANIM[@]}" --set media icon="$icon" icon.color=$color
+    $SB "${COLOR_ANIM[@]}" --set media icon=$'\xf4\x80\x91\xaa' icon.color=$note \
+                           --set media.toggle icon="$toggle" icon.color=$toggle_color \
+                           --set media.prev icon=$'\xf4\x80\x8a\x8a' icon.color=$skip \
+                           --set media.next icon=$'\xf4\x80\x8a\x8c' icon.color=$skip
     $SB "${SIZE_ANIM[@]}" --set media width="$WIDTH" label="$LABEL"
+    ;;
+
+  media.progress)
+    # The plate has no footprint, so a new width moves nothing and needs no geometry call.
+    trap - EXIT
+    [ "$SENDER" = media_progress ] || exit 0
+    # The helper pushes WIDTH: the plate's width in points, 0 when nothing is timed.
+    if [ "$WIDTH" -lt 1 ]; then $SB --set media.progress drawing=off; exit 0; fi
+    # Corners stay concentric with the island, and shrink to half the width while the plate is narrow.
+    radius=$PROGRESS_RADIUS
+    [ $((WIDTH / 2)) -ge "$radius" ] || radius=$((WIDTH / 2))
+    $SB --set media.progress drawing=on label.width=$WIDTH padding_right=$((-(ISLAND_GAP + PROGRESS_INSET + WIDTH))) \
+                             background.corner_radius=$radius
     ;;
 
   network)
