@@ -9,9 +9,10 @@ rm -f "${TMPDIR:-/tmp}"/sketchybar-hover.system.*
 rmdir "${TMPDIR:-/tmp}/sketchybar-spaces-retry" 2>/dev/null
 "$PLUGIN_DIR/popup.sh" build || exit 1
 
-# notch.sh switches to BAR_NOTCH when the main display has a camera housing.
+# The bar is clear and its three pills float on every display. notch.sh sets notch_width, which SketchyBar
+# uses only on a display with a notch.
 a=(--bar position=top height=30 margin=8 y_offset=8 corner_radius=12 shadow=on padding_left=0 padding_right=0
-    "${BAR_FLOAT[@]}" border_color=$BAR_EDGE blur_radius=0 display=main topmost=window)
+    "${BAR_NOTCH[@]}" blur_radius=0 display=main topmost=window)
 
 a+=(--default updates=when_shown
     icon.font="$FONT:Medium:13.0" label.font="$FONT:Semibold:13.0"
@@ -62,7 +63,7 @@ a+=(--add item spaces left
     --set half.left.end width=4
 
     --add bracket half.left half.left.start half.left.end
-    --set half.left "${PILL_STYLE[@]}" background.drawing=off)
+    --set half.left "${PILL_STYLE[@]}")
 
 # right side is added right to left
 # The resident helper pushes volume, media, network, tailscale, and system with <item>_state events.
@@ -79,16 +80,6 @@ a+=(--add item half.right.end right
     --set battery icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
                   update_freq=120 script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh battery"
     --subscribe battery power_source_change system_woke mouse.entered mouse.exited
-
-    --add item volume right
-    --set volume icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
-                 updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh volume"
-    --subscribe volume volume_state mouse.scrolled mouse.entered mouse.exited
-
-    --add item media center
-    --set media icon.padding_left=8 icon.padding_right=6 label.padding_right=8 label.max_chars=40
-                 updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh media"
-    --subscribe media media_state mouse.entered mouse.exited
 
     --add item notch center
     --set notch drawing=off updates=on script="$PLUGIN_DIR/notch.sh"
@@ -118,12 +109,36 @@ a+=(--add item half.right.end right
     --set half.right.start width=4
 
     --add bracket half.right half.right.start half.right.end
-    --set half.right "${PILL_STYLE[@]}" background.drawing=off
+    --set half.right "${PILL_STYLE[@]}"
 
     --add bracket system system.cpu system.memory
     --set system background.color=$CLEAR background.height=22 background.corner_radius=8)
 
+# The media island sits in the q position, which SketchyBar fills leftward from the notch, or from the
+# screen centre on a display without one. Items added first sit nearest the notch.
+a+=(--add item notch.gap q
+    --set notch.gap width=5
+
+    --add item island.media.end q
+    --set island.media.end width=4
+
+    --add item volume q
+    --set volume icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
+                 updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh volume"
+    --subscribe volume volume_state mouse.scrolled mouse.entered mouse.exited
+
+    --add item media q
+    --set media icon.padding_left=8 icon.padding_right=6 label.padding_right=8 label.max_chars=40
+                 updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh media"
+    --subscribe media media_state mouse.entered mouse.exited
+
+    --add item island.media.start q
+    --set island.media.start width=4
+
+    --add bracket island.media island.media.start island.media.end
+    --set island.media "${PILL_STYLE[@]}")
+
 $SB "${a[@]}"
-# The resident helper draws the island on a notched display and reports display changes.
+# The resident helper reports display changes.
 "$PLUGIN_DIR/popup.sh" start
 $SB --update

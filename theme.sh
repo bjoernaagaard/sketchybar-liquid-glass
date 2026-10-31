@@ -10,7 +10,6 @@ HOVER=0x12ffffff
 CLEAR=0x00ffffff
 BAR_COLOR=0xe61e2023
 BAR_EDGE=0x1fffffff
-ISLAND_COLOR=0xff000000
 # Apple's dark-mode system yellow and red, for readings under strain.
 WARN=0xffffd60a
 CRIT=0xffff453a
@@ -32,18 +31,11 @@ NUM_GAP=4        # number to first icon: 4 + 2 = 6 pt
 PILL_END=6       # last icon to pill edge: 2 + 6 = 8 pt, the same as pill edge to number
 MAX_APPS=4
 
-# Bar layouts. notch.sh picks one for the main display. On a notched display the bar is clear and
-# its two halves become pills beside the camera housing, so the island can grow out of the notch
-# between them. The half.*.start and half.*.end items supply the 4 pt inner padding in both layouts.
-BAR_FLOAT=(color=$BAR_COLOR border_width=1)
+# The bar is clear and holds three pills: half.left, island.media, and half.right. The *.start and *.end
+# items supply the 4 pt inner padding.
 BAR_NOTCH=(color=$CLEAR border_width=0)
 PILL_STYLE=(background.color=$BAR_COLOR background.border_color=$BAR_EDGE background.border_width=1
             background.corner_radius=12 background.height=30)
-
-# Dynamic Island: wing width beside the notch, open corner radius, and spring response in seconds.
-ISLAND_WING=36
-ISLAND_RADIUS=20
-ISLAND_RESPONSE=0.35
 
 # Native popups share the bar material without blur or size animation.
 POPUP_RADIUS=12
