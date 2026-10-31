@@ -45,6 +45,9 @@ PILL_STYLE=(background.color=$BAR_COLOR background.border_color=$BAR_EDGE backgr
 # A fixed cell for the volume label, so "100%" fits and the media island's fit stays stable. An explicit
 # width ignores padding: "100%" in SF Pro Medium 13 measures 35.4 pt, plus the 8 pt label.padding_right.
 VOLUME_LABEL_WIDTH=44
+# The CPU and memory labels get fixed cells the same way, so a new sample never resizes the right island.
+CPU_LABEL_WIDTH=41      # 35.4 pt plus the 5 pt label.padding_right
+MEMORY_LABEL_WIDTH=44   # 35.4 pt plus the 8 pt label.padding_right
 
 # The media island ends this far from the left island and from the notch.
 ISLAND_GAP=5

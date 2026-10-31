@@ -103,6 +103,8 @@ case "$NAME" in
     ;;
 
   system.cpu)
+    # The labels have fixed cells, so a new sample moves nothing and needs no geometry call.
+    trap - EXIT
     # The resident helper pushes CPU and MEM percents and a level for CPU, memory, and disk.
     [ "$SENDER" = system_state ] || exit 0
     tint() { case "$1" in crit) c=$CRIT ;; warn) c=$WARN ;; *) c=$TEXT2 ;; esac; }

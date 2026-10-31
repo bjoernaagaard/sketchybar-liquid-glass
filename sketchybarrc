@@ -108,12 +108,12 @@ a+=(--add item half.right.end right
 
     --add item system.memory right
     --set system.memory icon.padding_left=5 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=8
-                        updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh system"
+                        label.width=$MEMORY_LABEL_WIDTH updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh system"
     --subscribe system.memory mouse.entered mouse.exited
 
     --add item system.cpu right
     --set system.cpu icon.padding_left=8 icon.padding_right=6 label.color=$TEXT2 label.font="$FONT:Medium:13.0" label.padding_right=5
-                     updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh system"
+                     label.width=$CPU_LABEL_WIDTH updates=on script="$PLUGIN_DIR/status.sh" click_script="$PLUGIN_DIR/popup.sh system"
     --subscribe system.cpu system_state mouse.entered mouse.exited
 
     --add item half.right.start right
