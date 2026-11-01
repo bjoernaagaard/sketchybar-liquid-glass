@@ -57,12 +57,12 @@ case "$NAME" in
     if [ "$MEDIA" = unavailable ]; then note=$TEXT3; toggle=$'\xf4\x80\x8a\x84'; toggle_color=$TEXT3; skip=$TEXT3
     elif [ "$MEDIA" = playing ]; then note=$TEXT2; toggle=$'\xf4\x80\x8a\x86'; toggle_color=$TEXT; skip=$TEXT2
     else note=$TEXT3; toggle=$'\xf4\x80\x8a\x84'; toggle_color=$TEXT2; skip=$TEXT2; fi
-    honor_reduce_motion
     $SB "${COLOR_ANIM[@]}" --set media icon=$'\xf4\x80\x91\xaa' icon.color=$note \
                            --set media.toggle icon="$toggle" icon.color=$toggle_color \
                            --set media.prev icon=$'\xf4\x80\x8a\x8a' icon.color=$skip \
                            --set media.next icon=$'\xf4\x80\x8a\x8c' icon.color=$skip
-    $SB "${SIZE_ANIM[@]}" --set media width="$WIDTH" label="$LABEL"
+    # The width changes at once. The helper's springs move the island glass to it.
+    $SB --set media width="$WIDTH" label="$LABEL"
     ;;
 
   media.progress)

@@ -8,6 +8,10 @@ import os
 
 private let logger = Logger(subsystem: "com.bjoernaagaard.sketchybar", category: "popup")
 private let interactionLogger = Logger(subsystem: "com.bjoernaagaard.sketchybar", category: "popup.interaction")
+private let motionLogger = Logger(subsystem: "com.bjoernaagaard.sketchybar", category: "motion")
+// Instruments and the recordings read these intervals: one "spring" per island, from the retarget that starts
+// its motion to the frame where it settles.
+private let motionSignposter = OSSignposter(subsystem: "com.bjoernaagaard.sketchybar", category: "motion")
 
 enum PopupKind: String {
     case volume, clock, network, tailscale, media, system, front, battery, workspace, mode
@@ -822,7 +826,7 @@ struct Theme {
         for name in ["POPUP_RADIUS", "POPUP_WIDTH_VOLUME", "POPUP_WIDTH_CLOCK", "POPUP_WIDTH_NETWORK", "POPUP_WIDTH_TAILSCALE",
                      "POPUP_WIDTH_MEDIA", "POPUP_WIDTH_SYSTEM", "POPUP_WIDTH_FRONT", "POPUP_WIDTH_INFORMATION",
                      "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE", "ISLAND_GAP", "ISLAND_RADIUS", "MERGE_DISTANCE",
-                     "PROGRESS_INSET"] {
+                     "PROGRESS_INSET", "SPRING_RESIZE", "SPRING_EMERGE", "SPRING_RETRACT"] {
             guard let value = Double(try required(name)), value.isFinite, value >= 0 else { throw ConfigurationError.invalidValue(name) }
             numbers[name] = CGFloat(value)
         }
@@ -891,12 +895,42 @@ struct ItemQuery: Decodable {
         let size: [Double]
     }
 
+    let name: String
     let icon: Text?
     let label: Text?
     let boundingRects: [String: Bounds]
 
     enum CodingKeys: String, CodingKey {
-        case icon, label, boundingRects = "bounding_rects"
+        case name, icon, label, boundingRects = "bounding_rects"
+    }
+
+    // `sketchybar --query a --query b` prints one JSON object per item, back to back. This splits the output
+    // at its top-level braces, skipping braces inside strings, and decodes each object. An item that cannot be
+    // read is missing from the result, so callers match by `name`, not by position.
+    static func decodeAll(_ data: Data) -> [ItemQuery] {
+        var queries: [ItemQuery] = []
+        var depth = 0, start = data.startIndex
+        var inString = false, escaped = false
+        for index in data.indices {
+            let byte = data[index]
+            if inString {
+                if escaped { escaped = false }
+                else if byte == UInt8(ascii: "\\") { escaped = true }
+                else if byte == UInt8(ascii: "\"") { inString = false }
+                continue
+            }
+            switch byte {
+            case UInt8(ascii: "\""): inString = true
+            case UInt8(ascii: "{"):
+                if depth == 0 { start = index }
+                depth += 1
+            case UInt8(ascii: "}") where depth > 0:
+                depth -= 1
+                if depth == 0, let query = try? JSONDecoder().decode(ItemQuery.self, from: data[start...index]) { queries.append(query) }
+            default: break
+            }
+        }
+        return queries
     }
 
     // SketchyBar measures from the top left of the display. Only x and the width matter here.
@@ -1018,11 +1052,11 @@ final class GlassLayer {
     // The bar strip: y_offset 8, height 30, and the 8 pt margin below, as sketchybarrc sets them.
     private static let stripHeight: CGFloat = 46
     private let window = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+    private let container = NSGlassEffectContainerView()
     private let drops: [Island: NSGlassEffectView]
 
     init(theme: Theme) {
         let canvas = NSView()
-        let container = NSGlassEffectContainerView()
         container.spacing = theme.number("MERGE_DISTANCE")
         container.contentView = canvas
         var drops: [Island: NSGlassEffectView] = [:]
@@ -1064,12 +1098,165 @@ final class GlassLayer {
             guard let drop = drops[island] else { continue }
             drop.frame = frame.offsetBy(dx: -window.frame.minX, dy: -window.frame.minY)
             drop.isHidden = false
-            let placed = window.convertToScreen(drop.convert(drop.bounds, to: nil))
-            interactionLogger.debug("event=glass_place island=\(island.rawValue, privacy: .public) drop=\(NSStringFromRect(placed), privacy: .public) bracket=\(NSStringFromRect(frame), privacy: .public)")
         }
     }
 
+    // Where an island's drop is on screen now.
+    func frame(of island: Island) -> NSRect? {
+        guard let drop = drops[island], !drop.isHidden else { return nil }
+        return window.convertToScreen(drop.convert(drop.bounds, to: nil))
+    }
+
+    // A link on the glass view ticks with the display the glass is on. The caller owns it and invalidates it.
+    func makeDisplayLink(target: Any, selector: Selector) -> CADisplayLink {
+        container.displayLink(target: target, selector: selector)
+    }
+
     func close() { window.close() }
+}
+
+// A critically damped spring. A new target keeps the current value and velocity,
+// so an island that changes its mind mid-flight neither jumps nor stalls.
+struct Spring {
+    var value: CGFloat
+    var velocity: CGFloat = 0
+    var target: CGFloat
+
+    init(_ value: CGFloat) { self.value = value; target = value }
+
+    mutating func step(_ seconds: CGFloat, response: CGFloat) {
+        guard response > 0 else { settle(); return }
+        let omega = 2 * .pi / response
+        let offset = value - target
+        let rate = velocity + omega * offset
+        let decay = exp(-omega * seconds)
+        value = target + (offset + rate * seconds) * decay
+        velocity = (rate - omega * (offset + rate * seconds)) * decay
+    }
+
+    mutating func settle() { value = target; velocity = 0 }
+
+    var settled: Bool { abs(value - target) < 0.25 && abs(velocity) < 2 }
+}
+
+// Moves the island glass. Each drop has one Spring per horizontal edge: y and height do not move. Popups owns
+// the one Motion. It owns the display link, which runs only while a spring is unsettled and is invalidated
+// once every spring has settled, on a screen change, and at shutdown.
+final class Motion: NSObject {
+    private struct Drop {
+        var minX: Spring
+        var maxX: Spring
+        var minY: CGFloat
+        var height: CGFloat
+        var response: CGFloat
+        var interval: OSSignpostIntervalState?
+
+        var settled: Bool { minX.settled && maxX.settled }
+        var frame: NSRect { NSRect(x: minX.value, y: minY, width: maxX.value - minX.value, height: height) }
+    }
+
+    private let glass: GlassLayer
+    private var drops: [Island: Drop] = [:]
+    private var link: CADisplayLink?
+    private var lastTimestamp: CFTimeInterval?
+
+    init(glass: GlassLayer) {
+        self.glass = glass
+        super.init()
+    }
+
+    // Points each island's edges at a new frame. An island seen for the first time, and every island while
+    // Reduce Motion is on, settles at once. Otherwise the springs keep their value and velocity.
+    func retarget(_ frames: [Island: NSRect], response: CGFloat) {
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if reduceMotion { for island in Array(drops.keys) where drops[island]?.settled == false { settle(island) } }
+        for (island, frame) in frames {
+            guard var drop = drops[island] else {
+                var drop = Drop(minX: Spring(frame.minX), maxX: Spring(frame.maxX), minY: frame.minY, height: frame.height, response: response)
+                drop.minX.settle()
+                drops[island] = drop
+                glass.place([island: frame])
+                logPlacement(island, frame)
+                continue
+            }
+            guard abs(drop.minX.target - frame.minX) > 0.01 || abs(drop.maxX.target - frame.maxX) > 0.01
+                    || drop.minY != frame.minY || drop.height != frame.height else { continue }
+            let from = drop.frame
+            drop.minY = frame.minY
+            drop.height = frame.height
+            drop.response = response
+            drop.minX.target = frame.minX
+            drop.maxX.target = frame.maxX
+            motionLogger.debug("event=spring_retarget island=\(island.rawValue, privacy: .public) t=\(CACurrentMediaTime(), privacy: .public) from=\(Double(from.minX), privacy: .public),\(Double(from.maxX), privacy: .public) to=\(Double(frame.minX), privacy: .public),\(Double(frame.maxX), privacy: .public) response=\(Double(response), privacy: .public) reduce_motion=\(reduceMotion, privacy: .public)")
+            drops[island] = drop
+            if reduceMotion || drop.settled {
+                settle(island)
+            } else if drop.interval == nil {
+                drops[island]?.interval = motionSignposter.beginInterval("spring", id: motionSignposter.makeSignpostID(),
+                    "island=\(island.rawValue, privacy: .public) from_min=\(Double(from.minX), privacy: .public) from_max=\(Double(from.maxX), privacy: .public) to_min=\(Double(frame.minX), privacy: .public) to_max=\(Double(frame.maxX), privacy: .public) response=\(Double(response), privacy: .public)")
+            }
+        }
+        if drops.values.contains(where: { !$0.settled }) { startLink() } else { stopLink() }
+    }
+
+    // Ends every motion and forgets the drops, so the next placement settles at once. Also the shutdown path.
+    func stop() {
+        stopLink()
+        for island in Array(drops.keys) { endInterval(island) }
+        drops.removeAll()
+    }
+
+    private func startLink() {
+        guard link == nil else { return }
+        lastTimestamp = nil
+        let link = glass.makeDisplayLink(target: self, selector: #selector(step(_:)))
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    private func stopLink() {
+        link?.invalidate()
+        link = nil
+    }
+
+    // The link is added to RunLoop.main, so AppKit calls this on the main thread, which is the main actor.
+    @objc private func step(_ link: CADisplayLink) {
+        let sinceLast = lastTimestamp.map { link.timestamp - $0 } ?? link.targetTimestamp - link.timestamp
+        let seconds = CGFloat(min(1 / 30, max(0, sinceLast)))
+        lastTimestamp = link.timestamp
+        var frames: [Island: NSRect] = [:]
+        for island in Array(drops.keys) {
+            guard var drop = drops[island], !drop.settled else { continue }
+            drop.minX.step(seconds, response: drop.response)
+            drop.maxX.step(seconds, response: drop.response)
+            drops[island] = drop
+            if drop.settled { settle(island) } else { frames[island] = drop.frame }
+        }
+        glass.place(frames)
+        if drops.values.allSatisfy(\.settled) { stopLink() }
+    }
+
+    // Snaps an island to its target and ends its interval.
+    private func settle(_ island: Island) {
+        guard var drop = drops[island] else { return }
+        drop.minX.settle()
+        drop.maxX.settle()
+        drops[island] = drop
+        endInterval(island)
+        glass.place([island: drop.frame])
+        logPlacement(island, drop.frame)
+    }
+
+    private func endInterval(_ island: Island) {
+        guard let interval = drops[island]?.interval else { return }
+        drops[island]?.interval = nil
+        motionSignposter.endInterval("spring", interval, "island=\(island.rawValue, privacy: .public) settled")
+    }
+
+    private func logPlacement(_ island: Island, _ bracket: NSRect) {
+        let placed = glass.frame(of: island).map(NSStringFromRect) ?? "hidden"
+        interactionLogger.debug("event=glass_place island=\(island.rawValue, privacy: .public) drop=\(placed, privacy: .public) bracket=\(NSStringFromRect(bracket), privacy: .public)")
+    }
 }
 
 final class FlippedView: NSView {
@@ -1632,9 +1819,14 @@ final class Popups: NSObject, NSApplicationDelegate {
     var tailscaleCommand: Task<Void, Never>?
     var tailscaleLogin = false
     let bar: BarFeed
-    // The islands' glass, and the one task that reads the brackets to place it. A new read replaces a pending one.
+    // The islands' glass, the springs that move it, and the one task that reads the brackets to retarget them.
+    // A new read replaces a pending one.
     let glass: GlassLayer
+    let motion: Motion
     var islandsTask: Task<Void, Never>?
+    // SketchyBar's arrangement index of the main display. It changes only with the displays, so it is read
+    // once and forgotten when they change.
+    var displayIndex: Int?
     // One media-control stream feeds the bar item and the media popup.
     var mediaStream: Task<Void, Never>?
     var streamedMedia: MediaSnapshot?
@@ -1653,6 +1845,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         self.theme = theme
         bar = BarFeed(sketchybar: URL(fileURLWithPath: theme.sketchybarPath))
         glass = GlassLayer(theme: theme)
+        motion = Motion(glass: glass)
         super.init()
     }
 
@@ -1751,7 +1944,7 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     @objc func woke() {
         bar.pushAll()
-        fitMedia(after: .milliseconds(350))
+        fitMedia(after: .milliseconds(50))
         refreshIslands(after: .milliseconds(350))
     }
 
@@ -1835,28 +2028,29 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
     }
 
-    // Reads the three brackets at once and places the glass on their bounds. A bracket that cannot be read
-    // keeps its glass where it is.
-    func refreshIslands(after delay: Duration = .zero) {
+    // Reads the three brackets at once and points the glass springs at their bounds. A bracket that cannot be
+    // read keeps its glass where it is. After a display change, the delay gives SketchyBar time to arrange
+    // the displays before the index is read again.
+    func refreshIslands(after delay: Duration = .zero, remeasureDisplay: Bool = false) {
         islandsTask?.cancel()
         islandsTask = Task { [weak self] in
             if delay > .zero { try? await Task.sleep(for: delay) }
-            guard !Task.isCancelled, let frames = await self?.queryIslands(), !Task.isCancelled else { return }
-            self?.glass.place(frames)
+            guard !Task.isCancelled, let self else { return }
+            if remeasureDisplay { self.displayIndex = nil }
+            guard let frames = await self.queryIslands(), !Task.isCancelled else { return }
+            self.motion.retarget(frames, response: self.theme.number("SPRING_RESIZE"))
         }
     }
 
+    // One CLI process reads the three brackets. Its output holds one JSON object per bracket.
     func queryIslands() async -> [Island: NSRect]? {
-        guard let screen = NSScreen.screens.first else { return nil }
-        async let displayIndex = barDisplayIndex()
-        async let left = queryItem(Island.left.rawValue)
-        async let media = queryItem(Island.media.rawValue)
-        async let right = queryItem(Island.right.rawValue)
-        let queries: [(Island, ItemQuery?)] = await [(.left, left), (.media, media), (.right, right)]
-        guard !Task.isCancelled, let index = await displayIndex else { return nil }
+        guard let screen = NSScreen.screens.first, let index = await barDisplayIndex(),
+              let result = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath),
+                                                           Island.allCases.flatMap { ["--query", $0.rawValue] }),
+              !Task.isCancelled, result.status == 0 else { return nil }
         var frames: [Island: NSRect] = [:]
-        for (island, query) in queries {
-            if let frame = query?.frame(display: index, on: screen) { frames[island] = frame }
+        for query in ItemQuery.decodeAll(result.output) {
+            if let island = Island(rawValue: query.name), let frame = query.frame(display: index, on: screen) { frames[island] = frame }
         }
         return frames.isEmpty ? nil : frames
     }
@@ -1885,7 +2079,15 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     // SketchyBar's arrangement index of the main display, which names the key in `bounding_rects`.
+    // Only the first call after launch or a display change starts a process.
     func barDisplayIndex() async -> Int? {
+        if let displayIndex { return displayIndex }
+        let index = await readDisplayIndex()
+        if let index, !Task.isCancelled { displayIndex = index }
+        return index
+    }
+
+    func readDisplayIndex() async -> Int? {
         guard let displays = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath), ["--query", "displays"]),
               !Task.isCancelled, displays.status == 0,
               let objects = try? JSONSerialization.jsonObject(with: displays.output) as? [[String: Any]],
@@ -1896,9 +2098,12 @@ final class Popups: NSObject, NSApplicationDelegate {
     @objc func screensChanged() {
         close()
         glass.moveToBarScreen()
+        // The glass jumps to the new display instead of springing across it.
+        motion.stop()
+        displayIndex = nil
         // notch.sh sets the notch width for the new display, which moves the media island.
-        fitMedia(after: .milliseconds(350))
-        refreshIslands(after: .milliseconds(350))
+        fitMedia(after: .milliseconds(50))
+        refreshIslands(after: .milliseconds(350), remeasureDisplay: true)
         notchTask?.cancel()
         notchTask = Task { [weak self] in await self?.trigger("notch_change") }
     }
@@ -1920,6 +2125,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         mediaFitTask = nil
         islandsTask?.cancel()
         islandsTask = nil
+        motion.stop()
         glass.close()
         mediaProgressLoop?.cancel()
         mediaProgressLoop = nil
@@ -1976,9 +2182,9 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     func geometryChanged() {
         refreshIslands()
-        // status.sh calls this after every update, and spaces.sh again once its size animation settles
-        // (about 0.2 s), so the fit waits for the last call.
-        fitMedia(after: .milliseconds(350))
+        // The islands retarget now. A workspace switch fires its workspace, focus and front-app events within a
+        // few milliseconds, so the media fit waits 50 ms for the last of them.
+        fitMedia(after: .milliseconds(50))
         geometryGeneration += 1
         geometryTask?.cancel()
         geometryTask = nil

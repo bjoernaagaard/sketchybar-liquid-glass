@@ -1,7 +1,6 @@
 #!/bin/bash
 # Redraws every workspace pill and the front app from one AeroSpace snapshot.
 source "$CONFIG_DIR/theme.sh"
-honor_reduce_motion
 
 focused=${FOCUSED_WORKSPACE:-$(aerospace list-workspaces --focused)}
 windows=$(aerospace list-windows --all --format '%{workspace}|%{app-bundle-id}')
@@ -63,10 +62,16 @@ if [ ${#add[@]} -gt 0 ]; then
   $SB "${add[@]}"
 fi
 
-now=()    # images, visibility, text: cannot animate
-sizes=()  # widths
+# Images, visibility, text and sizes change at once; the helper's springs move the glass to the new sizes.
+now=()
+grow=()    # icons that were hidden: they start small and grow
+reduce_motion=
 colors=()
-collapsing=()
+
+# One query names the icons of the focused workspace that are drawn now. Only the others grow in.
+focused_icons=()
+for ((i = 0; i < MAX_APPS; i++)); do focused_icons+=(--query "ws.$focused.a$i"); done
+shown=" $($SB "${focused_icons[@]}" 2>/dev/null | jq -rs 'map(select(.geometry.drawing == "on") | .name) | join(" ")') "
 
 for ws in $workspaces; do
   case "$ws" in *[!a-zA-Z0-9_-]*|'') continue ;; esac
@@ -81,9 +86,9 @@ for ws in $workspaces; do
   n=${#apps[@]}
 
   if [ "$ws" = "$focused" ] && [ "$n" -gt 0 ]; then
-    sizes+=(--set "ws.$ws" label.padding_right=$NUM_GAP --set "ws.$ws.end" width=$PILL_END)
+    now+=(--set "ws.$ws" label.padding_right=$NUM_GAP --set "ws.$ws.end" width=$PILL_END)
   else
-    sizes+=(--set "ws.$ws" label.padding_right=8 --set "ws.$ws.end" width=0)
+    now+=(--set "ws.$ws" label.padding_right=8 --set "ws.$ws.end" width=0)
   fi
   if [ "$ws" = "$focused" ]; then
     colors+=(--set "ws.$ws" label.color=$TEXT --set "ws.$ws.pill" background.color=$PILL)
@@ -97,13 +102,18 @@ for ws in $workspaces; do
     if [ "$i" -ge "$n" ]; then
       now+=(--set "$item" drawing=off width=0)
     elif [ "$ws" = "$focused" ]; then
-      now+=(--set "$item" drawing=on background.image="app.${apps[$i]}")
-      sizes+=(--set "$item" width=$APP_SLOT background.image.scale=$ICON_SCALE)
-    elif [ ${#SIZE_ANIM[@]} -eq 0 ]; then
-      now+=(--set "$item" drawing=off width=0)
+      now+=(--set "$item" drawing=on width=$APP_SLOT background.image="app.${apps[$i]}")
+      case "$shown" in
+        *" $item "*) ;;
+        *)
+          # Under Reduce Motion a new icon appears at full size. Reading the setting launches a process,
+          # so only a switch that shows a new icon reads it.
+          [ -n "$reduce_motion" ] || reduce_motion=$(defaults read com.apple.universalaccess reduceMotion 2>/dev/null || echo 0)
+          if [ "$reduce_motion" = 1 ]; then now+=(background.image.scale=$ICON_SCALE)
+          else now+=(background.image.scale=$ICON_SCALE_START); grow+=(--set "$item" background.image.scale=$ICON_SCALE); fi ;;
+      esac
     else
-      sizes+=(--set "$item" width=0 background.image.scale=0)
-      collapsing+=("$item")
+      now+=(--set "$item" drawing=off width=0)
     fi
   done
 done
@@ -115,16 +125,5 @@ else
 fi
 
 $SB "${now[@]}"
-$SB "${SIZE_ANIM[@]}" "${sizes[@]}"
-$SB "${COLOR_ANIM[@]}" "${colors[@]}"
+$SB "${COLOR_ANIM[@]}" "${grow[@]}" "${colors[@]}"
 [ ! -x "$CONFIG_DIR/plugins/.popup-helper" ] || "$CONFIG_DIR/plugins/.popup-helper" geometry
-
-# A width-0 item still widens its pill by 2 pt, so hide each one once it has finished
-# collapsing. One that a newer switch is growing again has width above 0 and stays.
-{
-  [ ${#SIZE_ANIM[@]} -eq 0 ] || sleep 0.3
-  for item in "${collapsing[@]}"; do
-    [ "$($SB --query "$item" | jq '.geometry.width')" = 0 ] && $SB --set "$item" drawing=off
-  done
-  [ ! -x "$CONFIG_DIR/plugins/.popup-helper" ] || "$CONFIG_DIR/plugins/.popup-helper" geometry
-} &
