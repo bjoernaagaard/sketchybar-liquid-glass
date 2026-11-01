@@ -6,7 +6,13 @@ HELPER="$PLUGIN_DIR/.popup-helper"
 
 if [ "$1" = build ]; then
   [ ! -x "$HELPER" ] || "$HELPER" stop
-  if [ ! -x "$HELPER" ] || [ "$PLUGIN_DIR/popup.swift" -nt "$HELPER" ] || [ "$PLUGIN_DIR/popup-info.plist" -nt "$HELPER" ] || [ "$PLUGIN_DIR/popup.sh" -nt "$HELPER" ]; then
+  # The popup directory's own time changes when a source file is added or removed.
+  stale=
+  [ -x "$HELPER" ] || stale=1
+  for input in "$PLUGIN_DIR"/popup "$PLUGIN_DIR"/popup/*.swift "$PLUGIN_DIR/popup-info.plist" "$PLUGIN_DIR/popup.sh"; do
+    [ "$input" -nt "$HELPER" ] && stale=1
+  done
+  if [ -n "$stale" ]; then
     trap 'rm -f "$PLUGIN_DIR/.popup-build"' EXIT
     # Swift 6 includes three Approachable Concurrency features; enable the other two.
     # This is an AppKit app module, so UI and model state default to the main actor.
@@ -15,7 +21,7 @@ if [ "$1" = build ]; then
       -default-isolation MainActor \
       -enable-upcoming-feature NonisolatedNonsendingByDefault \
       -enable-upcoming-feature InferIsolatedConformances \
-      "$PLUGIN_DIR/popup.swift" -o "$PLUGIN_DIR/.popup-build" \
+      "$PLUGIN_DIR"/popup/*.swift -o "$PLUGIN_DIR/.popup-build" \
       -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$PLUGIN_DIR/popup-info.plist" || exit 1
     mv "$PLUGIN_DIR/.popup-build" "$HELPER"
   fi
