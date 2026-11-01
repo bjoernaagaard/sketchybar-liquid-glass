@@ -1047,17 +1047,25 @@ enum Island: String, CaseIterable {
 
 // The glass behind the islands: one borderless window on the bar's display, one level below SketchyBar's
 // item windows, which sit at kCGFloatingWindowLevel because sketchybarrc sets topmost=window. The window
-// ignores the mouse, so SketchyBar keeps every click and hover. Each drop follows its bracket's bounds.
+// ignores the mouse, so SketchyBar keeps every click and hover. Each island drop follows its bracket's bounds.
+// A fourth drop is the open popup's glass. It lives in the same container, so it can join its pill. The window
+// covers the bar strip, and also the popup while one shows.
 final class GlassLayer {
     // The bar strip: y_offset 8, height 30, and the 8 pt margin below, as sketchybarrc sets them.
     private static let stripHeight: CGFloat = 46
     private let window = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     private let container = NSGlassEffectContainerView()
     private let drops: [Island: NSGlassEffectView]
+    private let popupDrop = NSGlassEffectView()
+    private let mergeDistance: CGFloat
+    // The union of the frames the popup drop has been aimed at since it appeared, in screen coordinates.
+    // The window reaches it, plus the merge distance, until the drop is hidden.
+    private var popupReach: NSRect?
 
     init(theme: Theme) {
         let canvas = NSView()
-        container.spacing = theme.number("MERGE_DISTANCE")
+        mergeDistance = theme.number("MERGE_DISTANCE")
+        container.spacing = mergeDistance
         container.contentView = canvas
         var drops: [Island: NSGlassEffectView] = [:]
         for island in Island.allCases {
@@ -1070,6 +1078,11 @@ final class GlassLayer {
             drops[island] = drop
         }
         self.drops = drops
+        // The popup's glass is the style it has always had: untinted, with the popup's corners.
+        popupDrop.style = .regular
+        popupDrop.cornerRadius = theme.number("POPUP_RADIUS")
+        popupDrop.isHidden = true
+        canvas.addSubview(popupDrop)
         window.contentView = container
         window.isOpaque = false
         window.backgroundColor = .clear
@@ -1083,14 +1096,44 @@ final class GlassLayer {
         moveToBarScreen()
     }
 
-    // SketchyBar's display=main is the first screen AppKit lists (see Notch.main).
+    // SketchyBar's display=main is the first screen AppKit lists (see Notch.main). A new screen forgets the reach.
     func moveToBarScreen() {
+        popupReach = nil
+        reframe()
+    }
+
+    // The strip on the bar's display, plus every place a popup has reached on it. Resizing this window costs the
+    // glass a slow frame, so it grows when a popup goes somewhere new and never shrinks between popups. The drops
+    // are positioned relative to the window, so a new window frame re-places each visible drop on screen.
+    private func reframe() {
         guard let screen = NSScreen.screens.first else { return }
-        window.setFrame(NSRect(x: screen.frame.minX, y: screen.frame.maxY - Self.stripHeight,
-                               width: screen.frame.width, height: Self.stripHeight), display: false)
+        var frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - Self.stripHeight,
+                           width: screen.frame.width, height: Self.stripHeight)
+        if let popupReach { frame = frame.union(popupReach.insetBy(dx: -mergeDistance, dy: -mergeDistance)) }
+        guard frame != window.frame else { return }
+        let visible = (Array(drops.values) + [popupDrop]).filter { !$0.isHidden }
+        let onScreen = visible.map { window.convertToScreen($0.convert($0.bounds, to: nil)) }
+        window.setFrame(frame, display: false)
+        for (drop, rect) in zip(visible, onScreen) { drop.frame = rect.offsetBy(dx: -frame.minX, dy: -frame.minY) }
     }
 
     func show() { window.orderFrontRegardless() }
+
+    // Grows the window to reach a frame the popup drop is about to move to.
+    func extend(to frame: NSRect) {
+        popupReach = popupReach.map { $0.union(frame) } ?? frame
+        reframe()
+    }
+
+    var popupRadius: CGFloat { popupDrop.cornerRadius }
+
+    func placePopup(_ frame: NSRect) {
+        popupDrop.frame = frame.offsetBy(dx: -window.frame.minX, dy: -window.frame.minY)
+        popupDrop.isHidden = false
+    }
+
+    // Hides the popup drop. The window keeps its reach, so the next popup opens without a resize.
+    func hidePopup() { popupDrop.isHidden = true }
 
     // Frames are in AppKit screen coordinates. An island without a frame keeps its last one.
     func place(_ frames: [Island: NSRect]) {
@@ -1105,6 +1148,11 @@ final class GlassLayer {
     func frame(of island: Island) -> NSRect? {
         guard let drop = drops[island], !drop.isHidden else { return nil }
         return window.convertToScreen(drop.convert(drop.bounds, to: nil))
+    }
+
+    // Where the popup drop is on screen now.
+    var popupFrame: NSRect? {
+        popupDrop.isHidden ? nil : window.convertToScreen(popupDrop.convert(popupDrop.bounds, to: nil))
     }
 
     // A link on the glass view ticks with the display the glass is on. The caller owns it and invalidates it.
@@ -1139,9 +1187,10 @@ struct Spring {
     var settled: Bool { abs(value - target) < 0.25 && abs(velocity) < 2 }
 }
 
-// Moves the island glass. Each drop has one Spring per horizontal edge: y and height do not move. Popups owns
-// the one Motion. It owns the display link, which runs only while a spring is unsettled and is invalidated
-// once every spring has settled, on a screen change, and at shutdown.
+// Moves the glass. Each island drop has one Spring per horizontal edge: y and height do not move. The popup drop
+// has one per edge. Popups owns the one Motion. It owns the display link, which runs only while a spring is
+// unsettled and is invalidated once every spring has settled, on a screen change, and at shutdown.
+// It also owns the popup window's opacity, which follows the popup drop's geometry.
 final class Motion: NSObject {
     private struct Drop {
         var minX: Spring
@@ -1155,15 +1204,68 @@ final class Motion: NSObject {
         var frame: NSRect { NSRect(x: minX.value, y: minY, width: maxX.value - minX.value, height: height) }
     }
 
+    // The popup drop. It grows out of a pill, slides to the next popup, and is drawn back into its pill.
+    private struct Popup {
+        enum Phase { case open, retracting }
+        var minX: Spring, maxX: Spring, minY: Spring, maxY: Spring
+        var phase = Phase.open
+        var response: CGFloat
+        // The largest edge distance at the start of the current move. Progress is 1 - remaining / total.
+        var total: CGFloat = 0
+        // The content's opacity. It follows the geometry: up while the drop opens, down while it retracts.
+        var alpha: CGFloat = 0
+        var interval: OSSignpostIntervalState?
+        var done: (() -> Void)?
+
+        init(at frame: NSRect, response: CGFloat) {
+            minX = Spring(frame.minX); maxX = Spring(frame.maxX); minY = Spring(frame.minY); maxY = Spring(frame.maxY)
+            self.response = response
+        }
+
+        var settled: Bool { minX.settled && maxX.settled && minY.settled && maxY.settled }
+        var frame: NSRect { NSRect(x: minX.value, y: minY.value, width: max(0, maxX.value - minX.value), height: max(0, maxY.value - minY.value)) }
+        var target: NSRect { NSRect(x: minX.target, y: minY.target, width: maxX.target - minX.target, height: maxY.target - minY.target) }
+        var remaining: CGFloat {
+            max(abs(minX.value - minX.target), abs(maxX.value - maxX.target), abs(minY.value - minY.target), abs(maxY.value - maxY.target))
+        }
+        var progress: CGFloat { total > 0 ? min(1, max(0, 1 - remaining / total)) : 1 }
+
+        mutating func aim(at frame: NSRect) {
+            minX.target = frame.minX; maxX.target = frame.maxX; minY.target = frame.minY; maxY.target = frame.maxY
+        }
+
+        mutating func step(_ seconds: CGFloat) {
+            minX.step(seconds, response: response); maxX.step(seconds, response: response)
+            minY.step(seconds, response: response); maxY.step(seconds, response: response)
+        }
+
+        mutating func settle() { minX.settle(); maxX.settle(); minY.settle(); maxY.settle() }
+    }
+
+    // Under Reduce Motion the content fades over COLOR_ANIM's tanh 10, which is 10 frames at 60 Hz.
+    private static let fadeDuration: TimeInterval = 10.0 / 60
+
     private let glass: GlassLayer
+    private let content: NSWindow
     private var drops: [Island: Drop] = [:]
+    private var popup: Popup?
     private var link: CADisplayLink?
     private var lastTimestamp: CFTimeInterval?
+    // The task that waits for an animated fade to end and then runs its follow-up. Any other opacity change
+    // cancels it, and so does `stop`.
+    private var fadeTask: Task<Void, Never>?
+    private var fading = false
 
-    init(glass: GlassLayer) {
+    // `content` is the popup's window, which holds the popup's views on a clear background.
+    init(glass: GlassLayer, content: NSWindow) {
         self.glass = glass
+        self.content = content
         super.init()
     }
+
+    var popupShowing: Bool { popup != nil }
+
+    private var idle: Bool { drops.values.allSatisfy(\.settled) && popup?.settled != false }
 
     // Points each island's edges at a new frame. An island seen for the first time, and every island while
     // Reduce Motion is on, settles at once. Otherwise the springs keep their value and velocity.
@@ -1196,7 +1298,38 @@ final class Motion: NSObject {
                     "island=\(island.rawValue, privacy: .public) from_min=\(Double(from.minX), privacy: .public) from_max=\(Double(from.maxX), privacy: .public) to_min=\(Double(frame.minX), privacy: .public) to_max=\(Double(frame.maxX), privacy: .public) response=\(Double(response), privacy: .public)")
             }
         }
-        if drops.values.contains(where: { !$0.settled }) { startLink() } else { stopLink() }
+        updateLink()
+    }
+
+    // The popup opens out of its pill: the drop starts as the pill's rect and springs to the popup's frame.
+    func emerge(from pill: NSRect, to frame: NSRect, response: CGFloat) {
+        popup = Popup(at: pill, response: response)
+        glass.extend(to: frame)
+        placePopup(pill, settled: false)
+        setAlpha(0)
+        aim(at: frame, phase: .open, newContent: true, response: response)
+    }
+
+    // Another popup opens while one shows or retracts: the same springs retarget and keep their speed. A new
+    // popup's content starts at zero opacity. The same popup changing size keeps what it has shown.
+    func slide(to frame: NSRect, newContent: Bool, response: CGFloat) {
+        guard popup != nil else { return }
+        glass.extend(to: frame)
+        aim(at: frame, phase: .open, newContent: newContent, response: response)
+    }
+
+    // The drop is drawn back into its pill, then hidden, then `then` runs. A slide or an emerge before that
+    // retargets the drop and drops `then`. Under Reduce Motion the drop stays and the content fades.
+    func retract(into pill: NSRect, response: CGFloat, then: @escaping () -> Void) {
+        guard var current = popup, current.phase == .open else { return }
+        current.done = then
+        popup = current
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            popup?.phase = .retracting
+            fade(to: 0) { [weak self] in self?.finishRetract() }
+        } else {
+            aim(at: pill, phase: .retracting, newContent: false, response: response)
+        }
     }
 
     // Ends every motion and forgets the drops, so the next placement settles at once. Also the shutdown path.
@@ -1204,6 +1337,133 @@ final class Motion: NSObject {
         stopLink()
         for island in Array(drops.keys) { endInterval(island) }
         drops.removeAll()
+        if let interval = popup?.interval { motionSignposter.endInterval("spring", interval, "island=popup stopped") }
+        popup = nil
+        setAlpha(1)
+        glass.hidePopup()
+    }
+
+    private func updateLink() {
+        if idle { stopLink() } else { startLink() }
+    }
+
+    // Points the popup drop's four edges at a frame. It settles at once under Reduce Motion, and the content
+    // fades in place when the content is new.
+    private func aim(at frame: NSRect, phase: Popup.Phase, newContent: Bool, response: CGFloat) {
+        guard var popup else { return }
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let from = popup.frame
+        let target = popup.target
+        let moved = abs(target.minX - frame.minX) > 0.01 || abs(target.maxX - frame.maxX) > 0.01
+            || abs(target.minY - frame.minY) > 0.01 || abs(target.maxY - frame.maxY) > 0.01
+        let phaseChanged = popup.phase != phase
+        guard moved || phaseChanged || newContent else { return }
+        popup.phase = phase
+        popup.done = phase == .open ? nil : popup.done
+        popup.response = response
+        popup.aim(at: frame)
+        popup.total = newContent || phaseChanged ? popup.remaining : max(popup.total, popup.remaining)
+        if newContent { popup.alpha = 0 }
+        if moved {
+            motionLogger.debug("event=spring_retarget island=popup t=\(CACurrentMediaTime(), privacy: .public) from=\(Double(from.minX), privacy: .public),\(Double(from.minY), privacy: .public),\(Double(from.maxX), privacy: .public),\(Double(from.maxY), privacy: .public) to=\(Double(frame.minX), privacy: .public),\(Double(frame.minY), privacy: .public),\(Double(frame.maxX), privacy: .public),\(Double(frame.maxY), privacy: .public) response=\(Double(response), privacy: .public) reduce_motion=\(reduceMotion, privacy: .public)")
+        }
+        if reduceMotion {
+            popup.settle()
+            popup.alpha = 1
+            self.popup = popup
+            endPopupInterval()
+            placePopup(popup.frame, settled: true)
+            if newContent {
+                setAlpha(0)
+                fade(to: 1)
+            }
+        } else if popup.settled {
+            self.popup = popup
+            settlePopup()
+        } else {
+            if popup.interval == nil {
+                popup.interval = motionSignposter.beginInterval("spring", id: motionSignposter.makeSignpostID(),
+                    "island=popup from_min=\(Double(from.minX), privacy: .public) from_max=\(Double(from.maxX), privacy: .public) to_min=\(Double(frame.minX), privacy: .public) to_max=\(Double(frame.maxX), privacy: .public) response=\(Double(response), privacy: .public)")
+            }
+            self.popup = popup
+            updateAlpha()
+        }
+        updateLink()
+    }
+
+    // Opacity follows the geometry, so an interrupted move never leaves the content out of step with the glass.
+    // The drop opening raises it from half the way, and never lowers it. The drop retracting lowers it until half
+    // the way back, and never raises it.
+    private func updateAlpha() {
+        guard var popup else { return }
+        switch popup.phase {
+        case .open: popup.alpha = max(popup.alpha, min(1, max(0, (popup.progress - 0.5) * 2)))
+        case .retracting: popup.alpha = min(popup.alpha, min(1, max(0, (0.5 - popup.progress) * 2)))
+        }
+        self.popup = popup
+        setAlpha(popup.alpha)
+    }
+
+    // Sets the content's opacity now, replacing any fade in flight.
+    private func setAlpha(_ alpha: CGFloat) {
+        fadeTask?.cancel()
+        fadeTask = nil
+        if fading {
+            fading = false
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0
+                content.animator().alphaValue = alpha
+            }
+        } else if content.alphaValue != alpha {
+            content.alphaValue = alpha
+        }
+    }
+
+    // Fades the content's opacity over COLOR_ANIM's duration. `then` runs at the end unless something else set
+    // the opacity first.
+    private func fade(to alpha: CGFloat, then: (() -> Void)? = nil) {
+        fadeTask?.cancel()
+        fadeTask = nil
+        fading = true
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = Self.fadeDuration
+            content.animator().alphaValue = alpha
+        }
+        fadeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.fadeDuration))
+            guard !Task.isCancelled, let self else { return }
+            self.fadeTask = nil
+            self.fading = false
+            then?()
+        }
+    }
+
+    private func settlePopup() {
+        guard var popup else { return }
+        popup.settle()
+        self.popup = popup
+        endPopupInterval()
+        if popup.phase == .retracting {
+            finishRetract()
+        } else {
+            self.popup?.alpha = 1
+            placePopup(popup.frame, settled: true)
+            setAlpha(1)
+        }
+    }
+
+    private func finishRetract() {
+        guard let popup, popup.phase == .retracting else { return }
+        let done = popup.done
+        self.popup = nil
+        glass.hidePopup()
+        done?()
+    }
+
+    private func endPopupInterval() {
+        guard let interval = popup?.interval else { return }
+        popup?.interval = nil
+        motionSignposter.endInterval("spring", interval, "island=popup settled")
     }
 
     private func startLink() {
@@ -1233,7 +1493,42 @@ final class Motion: NSObject {
             if drop.settled { settle(island) } else { frames[island] = drop.frame }
         }
         glass.place(frames)
-        if drops.values.allSatisfy(\.settled) { stopLink() }
+        if var moving = popup, !moving.settled {
+            moving.step(seconds)
+            popup = moving
+            if moving.settled {
+                settlePopup()
+            } else {
+                placePopup(moving.frame, settled: false)
+                updateAlpha()
+            }
+        }
+        if idle { stopLink() }
+    }
+
+    // Places the popup drop and carries the content with it: the content's top centre rides at the drop's top centre,
+    // and while the drop moves the content is masked to the drop's shape, so no text shows outside the glass.
+    // Settled open, the drop is the panel's frame and the mask goes.
+    private func placePopup(_ frame: NSRect, settled: Bool) {
+        glass.placePopup(frame)
+        let size = content.frame.size
+        let origin = NSPoint(x: (frame.midX - size.width / 2).rounded(), y: (frame.maxY - size.height).rounded())
+        if content.frame.origin != origin { content.setFrameOrigin(origin) }
+        guard let view = content.contentView else { return }
+        if settled && popup?.phase != .retracting {
+            view.layer?.mask = nil
+            return
+        }
+        view.wantsLayer = true
+        let mask = (view.layer?.mask as? CAShapeLayer) ?? CAShapeLayer()
+        let inWindow = NSRect(x: frame.minX - origin.x, y: frame.minY - origin.y, width: frame.width, height: frame.height)
+        let radius = min(glass.popupRadius, frame.width / 2, frame.height / 2)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        mask.frame = view.bounds
+        mask.path = CGPath(roundedRect: view.convert(inWindow, from: nil), cornerWidth: radius, cornerHeight: radius, transform: nil)
+        if view.layer?.mask !== mask { view.layer?.mask = mask }
+        CATransaction.commit()
     }
 
     // Snaps an island to its target and ends its interval.
@@ -1819,11 +2114,14 @@ final class Popups: NSObject, NSApplicationDelegate {
     var tailscaleCommand: Task<Void, Never>?
     var tailscaleLogin = false
     let bar: BarFeed
-    // The islands' glass, the springs that move it, and the one task that reads the brackets to retarget them.
-    // A new read replaces a pending one.
+    // The islands' and the popup's glass, the springs that move it, and the one task that reads the brackets to
+    // retarget the islands. A new read replaces a pending one. The panel holds the popup's content and input only;
+    // its glass is a drop in GlassLayer that moves with Motion.
     let glass: GlassLayer
     let motion: Motion
     var islandsTask: Task<Void, Never>?
+    // The popup whose content the panel shows now. A rebuild of the same popup keeps its content visible.
+    var contentTarget: UUID?
     // SketchyBar's arrangement index of the main display. It changes only with the displays, so it is read
     // once and forgotten when they change.
     var displayIndex: Int?
@@ -1845,7 +2143,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         self.theme = theme
         bar = BarFeed(sketchybar: URL(fileURLWithPath: theme.sketchybarPath))
         glass = GlassLayer(theme: theme)
-        motion = Motion(glass: glass)
+        motion = Motion(glass: glass, content: panel)
         super.init()
     }
 
@@ -1858,7 +2156,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         glass.show()
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        panel.hasShadow = false
         panel.level = .popUpMenu
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         panel.hidesOnDeactivate = false
@@ -2098,8 +2396,10 @@ final class Popups: NSObject, NSApplicationDelegate {
     @objc func screensChanged() {
         close()
         glass.moveToBarScreen()
-        // The glass jumps to the new display instead of springing across it.
+        // The glass jumps to the new display instead of springing across it. That drops a retract in flight, so
+        // the panel goes now.
         motion.stop()
+        panel.orderOut(nil)
         displayIndex = nil
         // notch.sh sets the notch width for the new display, which moves the media island.
         fitMedia(after: .milliseconds(50))
@@ -2211,6 +2511,7 @@ final class Popups: NSObject, NSApplicationDelegate {
                 let frame = self.panel.frame
                 let x = max(screen.frame.minX + inset, min(rect.midX - frame.width / 2, screen.frame.maxX - inset - frame.width))
                 self.panel.setFrameOrigin(NSPoint(x: x, y: rect.minY - inset - frame.height))
+                self.motion.slide(to: self.panel.frame, newContent: false, response: self.theme.number("SPRING_EMERGE"))
             }
             self.pointerMoved()
         }
@@ -2384,8 +2685,10 @@ final class Popups: NSObject, NSApplicationDelegate {
                 return
             }
             interactionLogger.debug("event=candidate_accepted kind=\(next.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public)")
-            self.dismiss(suppress: false)
+            // The panel and its drop stay: the new popup slides the same drop, or turns a retract around.
+            self.dismiss(suppress: false, replacing: true)
             self.lifecycle = .opening(target)
+            self.panel.ignoresMouseEvents = false
             self.anchor = rect
             self.openingHasAnchor = true
             switch next {
@@ -2435,7 +2738,8 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     @objc func close() { dismiss(suppress: true) }
 
-    func dismiss(suppress: Bool) {
+    // `replacing` is for a popup that opens in the place of this one: its drop slides on instead of retracting.
+    func dismiss(suppress: Bool, replacing: Bool = false) {
         let target = suppress ? (candidate ?? lifecycle.target) : lifecycle.target
         if let target {
             interactionLogger.debug("event=dismiss kind=\(target.kind.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public) reason=\(suppress ? "close" : "replacement_or_pointer_exit", privacy: .public) candidate=\(self.candidate?.id.uuidString ?? "none", privacy: .public)")
@@ -2459,11 +2763,30 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
         mediaSeeking = false
         pendingMediaSeek = nil
-        panel.orderOut(nil)
+        if !replacing { retractPopup() }
     }
 
-    // The panel holds system glass. Only the glass view's contentView is guaranteed to sit inside the glass,
-    // so the flipped content view, or the container of the scroll view that holds it, is that contentView.
+    // The drop is drawn back into its pill while the content fades with it, then the panel goes. Until then the
+    // panel takes no clicks.
+    func retractPopup() {
+        panel.ignoresMouseEvents = true
+        guard motion.popupShowing else { panel.orderOut(nil); return }
+        motion.retract(into: pill(containing: anchor), response: theme.number("SPRING_RETRACT")) { [weak self] in
+            self?.panel.orderOut(nil)
+        }
+    }
+
+    // Where a popup grows out of and is drawn back into: the anchor's span of the island drop that holds it, at the
+    // drop's height, so the popup leaves from its item and not from the whole island. A rect outside every island
+    // stands for itself.
+    func pill(containing rect: NSRect) -> NSRect {
+        guard let island = Island.allCases.lazy.compactMap({ self.glass.frame(of: $0) })
+            .first(where: { $0.insetBy(dx: -1, dy: -1).contains(rect) }) else { return rect }
+        return NSRect(x: rect.minX, y: island.minY, width: rect.width, height: island.height)
+    }
+
+    // The panel holds the popup's views on a clear background. Its glass is the popup drop in GlassLayer, which
+    // follows the panel's frame: it grows out of the anchor's pill, or slides on from the popup that showed.
     func surface(width: CGFloat, height: CGFloat) -> NSView {
         let screen = NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.screens[0]
         let inset = theme.number("POPUP_GAP")
@@ -2471,22 +2794,28 @@ final class Popups: NSObject, NSApplicationDelegate {
         let visibleHeight = min(height, anchor.minY - screen.visibleFrame.minY - inset * 2)
         panel.setFrame(NSRect(x: x, y: anchor.minY - inset - visibleHeight, width: width, height: visibleHeight), display: false)
         let view = FlippedView(frame: NSRect(x: 0, y: 0, width: width, height: height))
-        let glass = NSGlassEffectView(frame: NSRect(x: 0, y: 0, width: width, height: visibleHeight))
-        glass.style = .regular
-        glass.cornerRadius = theme.number("POPUP_RADIUS")
         if height > visibleHeight {
-            let container = NSView(frame: glass.bounds)
+            let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: visibleHeight))
             let scroll = NSScrollView(frame: container.bounds.insetBy(dx: 1, dy: theme.number("POPUP_RADIUS")))
             scroll.drawsBackground = false
             scroll.hasVerticalScroller = true
             scroll.documentView = view
             container.addSubview(scroll)
-            glass.contentView = container
+            panel.contentView = container
         } else {
-            glass.contentView = view
+            panel.contentView = view
         }
-        panel.contentView = glass
         panel.title = item?.rawValue ?? ""
+        if let id = lifecycle.target?.id {
+            let response = theme.number("SPRING_EMERGE")
+            let newContent = contentTarget != id
+            contentTarget = id
+            if motion.popupShowing {
+                motion.slide(to: panel.frame, newContent: newContent, response: response)
+            } else {
+                motion.emerge(from: pill(containing: anchor), to: panel.frame, response: response)
+            }
+        }
         return view
     }
 
