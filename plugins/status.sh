@@ -78,6 +78,11 @@ case "$NAME" in
                              background.corner_radius=$radius
     ;;
 
+  bluetooth)
+    # FiraCode Nerd Font U+F294 is fa-bluetooth_b, verified in the installed font.
+    $SB --set bluetooth icon=$'\xef\x8a\x94' icon.font="FiraCode Nerd Font:Regular:13.0"
+    ;;
+
   network)
     [ "$SENDER" = network_state ] || exit 0
     # SF Pro network: U+100906, verified in SF-Pro.ttf as glyph 14009.

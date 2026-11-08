@@ -1,11 +1,11 @@
 import AppKit
 
 enum PopupKind: String {
-    case volume, clock, network, tailscale, media, system, front, battery, workspace, mode
+    case volume, clock, network, bluetooth, tailscale, media, system, front, battery, workspace, mode
 }
 
 enum PopupSource: Equatable {
-    case volume, clock, network, tailscale, media, system, cpu, memory, front, frontIcon, battery, mode
+    case volume, clock, network, bluetooth, tailscale, media, system, cpu, memory, front, frontIcon, battery, mode
     case workspace(String, String)
 
     init?(rawValue: String) {
@@ -13,6 +13,7 @@ enum PopupSource: Equatable {
         case "volume": self = .volume
         case "clock": self = .clock
         case "network": self = .network
+        case "bluetooth": self = .bluetooth
         case "tailscale": self = .tailscale
         case "media": self = .media
         case "system": self = .system
@@ -36,6 +37,7 @@ enum PopupSource: Equatable {
         case .volume: "volume"
         case .clock: "clock"
         case .network: "network"
+        case .bluetooth: "bluetooth"
         case .tailscale: "tailscale"
         case .media: "media"
         case .system: "system"
@@ -54,6 +56,7 @@ enum PopupSource: Equatable {
         case .volume: .volume
         case .clock: .clock
         case .network: .network
+        case .bluetooth: .bluetooth
         case .tailscale: .tailscale
         case .media: .media
         case .system, .cpu, .memory: .system

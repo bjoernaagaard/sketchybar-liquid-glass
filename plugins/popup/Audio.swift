@@ -40,13 +40,17 @@ struct Audio {
         scalar(system, address(kAudioHardwarePropertyDefaultOutputDevice), AudioObjectID(0)) ?? 0
     }
 
-    static func devices() -> [(id: AudioObjectID, name: String)] {
+    static func deviceIDs() -> [AudioObjectID] {
         var property = address(kAudioHardwarePropertyDevices)
         var size: UInt32 = 0
         guard AudioObjectGetPropertyDataSize(system, &property, 0, nil, &size) == noErr else { return [] }
         var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
         guard AudioObjectGetPropertyData(system, &property, 0, nil, &size, &ids) == noErr else { return [] }
-        return ids.compactMap { id in
+        return ids
+    }
+
+    static func devices() -> [(id: AudioObjectID, name: String)] {
+        return deviceIDs().compactMap { id in
             var streams = address(kAudioDevicePropertyStreams, kAudioDevicePropertyScopeOutput)
             var bytes: UInt32 = 0
             guard AudioObjectGetPropertyDataSize(id, &streams, 0, nil, &bytes) == noErr, bytes > 0,
@@ -58,6 +62,15 @@ struct Audio {
                   let name else { return nil }
             return (id, name.takeRetainedValue() as String)
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    static func uid(_ id: AudioObjectID) -> String? {
+        var property = address(kAudioDevicePropertyDeviceUID)
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(id, &property, 0, nil, &size, &value) == noErr,
+              let value else { return nil }
+        return value.takeRetainedValue() as String
     }
 
     static func channels(_ id: AudioObjectID) -> [AudioObjectPropertyElement] {

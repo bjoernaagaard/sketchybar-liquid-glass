@@ -1,4 +1,5 @@
 import AppKit
+import CoreAudio
 import EventKit
 
 final class Popups: NSObject, NSApplicationDelegate {
@@ -36,6 +37,8 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     var openingHasAnchor = false
 
+    var pointerManagesPopup = true
+
     var anchor = NSRect.zero
 
     var monitors: [Any] = []
@@ -51,6 +54,14 @@ final class Popups: NSObject, NSApplicationDelegate {
     var deviceSignature = ""
 
     var networkState: NetworkState?
+
+    let bluetooth = Bluetooth()
+    var bluetoothSignature = ""
+    var bluetoothErrors: [String: String] = [:]
+    var bluetoothPendingOutput: BluetoothOutputRequest?
+    var bluetoothOutputListener: Audio.Listener?
+    var bluetoothOutputWatches: [(id: AudioObjectID, address: AudioObjectPropertyAddress)] = []
+    var bluetoothScroll: NSScrollView?
 
     var front: FrontSnapshot?
 
@@ -198,6 +209,7 @@ final class Popups: NSObject, NSApplicationDelegate {
                 switch self.item {
                 case .volume: self.refreshVolume()
                 case .network: self.refreshNetwork()
+                case .bluetooth: self.refreshBluetooth()
                 case .tailscale: if Date().timeIntervalSince(self.tailscaleRead) >= 2 { self.refreshTailscale() }
                 case .media: self.refreshMedia()
                 case .clock:
@@ -215,7 +227,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         refreshIslands()
         startMediaStream()
         switch initialCommand {
-        case .toggle(let source): show(source)
+        case .toggle(let source): show(source, requiresPointer: source.kind != .bluetooth)
         case .hover(let source): show(source)
         case .volumeScroll(let notches): scrollVolume(notches)
         case .media(let action): performMedia(action)
@@ -245,6 +257,8 @@ final class Popups: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        clearBluetoothOutputRequest()
+        bluetooth.shutdown()
         calendarAccessTask?.cancel()
         calendarAccessTask = nil
         candidateTask?.cancel()
@@ -300,7 +314,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             bar.pushAll()
             fitMedia()
             refreshIslands()
-        case .toggle(let source): show(source)
+        case .toggle(let source): show(source, requiresPointer: source.kind != .bluetooth)
         case .media(let action): performMedia(action)
         }
     }
@@ -368,6 +382,10 @@ final class Popups: NSObject, NSApplicationDelegate {
             return
         }
         guard lifecycle.target != nil, openingHasAnchor, geometryTask == nil else { return }
+        if !pointerManagesPopup {
+            guard anchor.contains(point) || (isOpen && panel.frame.contains(point)) else { return }
+            pointerManagesPopup = true
+        }
         if anchor.contains(point) { return }
         if isOpen {
             let popup = panel.frame
@@ -383,7 +401,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         dismiss(suppress: false)
     }
 
-    func show(_ source: PopupSource) {
+    func show(_ source: PopupSource, requiresPointer: Bool = true) {
         if lifecycle.target?.source.identity == source.identity {
             interactionLogger.debug("event=show_ignored reason=already_active kind=\(source.kind.rawValue, privacy: .public)")
             return
@@ -470,7 +488,7 @@ final class Popups: NSObject, NSApplicationDelegate {
                 }
                 return
             }
-            guard let rect, rect.contains(NSEvent.mouseLocation) else {
+            guard let rect, !requiresPointer || rect.contains(NSEvent.mouseLocation) else {
                 interactionLogger.debug("event=candidate_rejected kind=\(next.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public) reason=anchor_or_pointer")
                 if let source = self.probeSources.values.first {
                     self.candidateProbes[source.identity]?.cancel()
@@ -487,8 +505,10 @@ final class Popups: NSObject, NSApplicationDelegate {
             self.panel.ignoresMouseEvents = false
             self.anchor = rect
             self.openingHasAnchor = true
+            self.pointerManagesPopup = requiresPointer || rect.contains(NSEvent.mouseLocation)
             switch next {
             case .volume: self.buildVolume()
+            case .bluetooth: self.buildBluetooth()
             case .network:
                 self.networkState = readNetworkState(context: "opening")
                 self.buildNetwork()
@@ -528,7 +548,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             if next == .media { self.refreshMedia() }
             if next == .front { self.refreshFront() }
             if next == .battery || next == .workspace || next == .mode { self.refreshInformation() }
-            self.pointerMoved()
+            if requiresPointer { self.pointerMoved() }
         }
     }
 
@@ -536,6 +556,9 @@ final class Popups: NSObject, NSApplicationDelegate {
 
     // `replacing` is for a popup that opens in the place of this one: its drop slides on instead of retracting.
     func dismiss(suppress: Bool, replacing: Bool = false) {
+        if lifecycle.target?.kind == .bluetooth {
+            bluetoothScroll = nil
+        }
         let target = suppress ? (candidate ?? lifecycle.target) : lifecycle.target
         if let target {
             interactionLogger.debug("event=dismiss kind=\(target.kind.rawValue, privacy: .public) id=\(target.id.uuidString, privacy: .public) reason=\(suppress ? "close" : "replacement_or_pointer_exit", privacy: .public) candidate=\(self.candidate?.id.uuidString ?? "none", privacy: .public)")

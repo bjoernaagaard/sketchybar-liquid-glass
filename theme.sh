@@ -73,6 +73,7 @@ POPUP_RADIUS=12
 POPUP_WIDTH_VOLUME=220      # "✓  Studio Display Speakers" 171
 POPUP_WIDTH_CLOCK=252       # seven day columns of 31.4 hold the 22 pt today circle
 POPUP_WIDTH_NETWORK=244     # "Thunderbolt Ethernet Slot 0" at the 22 pt indent, which 232 cut on the bar
+POPUP_WIDTH_BLUETOOTH=300   # AirPods Max name, output control, and a visible scrollbar
 POPUP_WIDTH_TAILSCALE=260   # "Allow Incoming Connections" checkbox 201
 POPUP_WIDTH_MEDIA=280       # 128 pt seek slider between two 56 pt time labels
 POPUP_WIDTH_SYSTEM=280      # memory legend at 11 pt, 240

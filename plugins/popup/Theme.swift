@@ -30,7 +30,7 @@ struct Theme {
         guard let pid = Int32(try required("POPUP_BAR_PID")), pid > 0 else { throw ConfigurationError.invalidValue("POPUP_BAR_PID") }
         barPID = pid
         var numbers: [String: CGFloat] = [:]
-        for name in ["POPUP_RADIUS", "POPUP_WIDTH_VOLUME", "POPUP_WIDTH_CLOCK", "POPUP_WIDTH_NETWORK", "POPUP_WIDTH_TAILSCALE",
+        for name in ["POPUP_RADIUS", "POPUP_WIDTH_VOLUME", "POPUP_WIDTH_CLOCK", "POPUP_WIDTH_NETWORK", "POPUP_WIDTH_BLUETOOTH", "POPUP_WIDTH_TAILSCALE",
                      "POPUP_WIDTH_MEDIA", "POPUP_WIDTH_SYSTEM", "POPUP_WIDTH_FRONT", "POPUP_WIDTH_INFORMATION",
                      "POPUP_GAP", "POPUP_PADDING", "POPUP_ROW", "CALENDAR_TODAY_SIZE", "ISLAND_GAP", "ISLAND_RADIUS", "MERGE_DISTANCE",
                      "PROGRESS_INSET", "SPRING_RESIZE", "SPRING_EMERGE", "SPRING_RETRACT"] {
@@ -61,6 +61,7 @@ struct Theme {
         case .volume: number("POPUP_WIDTH_VOLUME")
         case .clock: number("POPUP_WIDTH_CLOCK")
         case .network: number("POPUP_WIDTH_NETWORK")
+        case .bluetooth: number("POPUP_WIDTH_BLUETOOTH")
         case .tailscale: number("POPUP_WIDTH_TAILSCALE")
         case .media: number("POPUP_WIDTH_MEDIA")
         case .system: number("POPUP_WIDTH_SYSTEM")
