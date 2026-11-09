@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import CoreAudio
 import SystemConfiguration
 
@@ -19,13 +20,25 @@ struct ItemQuery: Decodable {
         let size: [Double]
     }
 
+    struct Geometry: Decodable {
+        let drawing: String
+        let width: Double
+        let paddingLeft: Double
+        let paddingRight: Double
+
+        enum CodingKeys: String, CodingKey {
+            case drawing, width, paddingLeft = "padding_left", paddingRight = "padding_right"
+        }
+    }
+
     let name: String
+    let geometry: Geometry?
     let icon: Text?
     let label: Text?
     let boundingRects: [String: Bounds]
 
     enum CodingKeys: String, CodingKey {
-        case name, icon, label, boundingRects = "bounding_rects"
+        case name, icon, label, geometry, boundingRects = "bounding_rects"
     }
 
     // `sketchybar --query a --query b` prints one JSON object per item, back to back. This splits the output
@@ -73,6 +86,143 @@ struct ItemQuery: Decodable {
     }
 }
 
+// The script returns one snapshot, not a shell command. The helper owns its publication.
+struct WorkspaceSnapshot: Decodable {
+    let add: [String]
+    let now: [String]
+    let animation: [String]
+    let colorAnimation: [String]
+    let items: [String]
+}
+
+// The variable-width items in half.left. Fixed-width items use their configured width, not their
+// bounding rectangle: SketchyBar can report a nonzero rectangle for an item with width zero.
+private struct WorkspaceFootprint {
+    var drawing: Bool
+    var width: Double?
+    var label: String
+    var paddingLeft: Double
+    var paddingRight: Double
+    let measured: Double
+    let originalLabel: String
+    let originalPadding: Double
+    let hiddenMode: Bool
+    let outerPadding: Double
+
+    init(_ query: ItemQuery, display: Int) {
+        drawing = query.geometry?.drawing == "on"
+        width = query.geometry.flatMap { $0.width >= 0 ? $0.width : nil }
+        label = query.label?.value ?? ""
+        paddingLeft = query.label?.paddingLeft ?? 0
+        paddingRight = query.label?.paddingRight ?? 0
+        measured = query.bounds(display: display)?.width ?? 0
+        originalLabel = label
+        originalPadding = paddingLeft + paddingRight
+        hiddenMode = query.name == "mode" && !drawing
+        outerPadding = query.name == "mode" ? (query.geometry?.paddingLeft ?? 0) + (query.geometry?.paddingRight ?? 0) : 0
+    }
+
+    init() {
+        drawing = true
+        width = nil
+        label = ""
+        paddingLeft = 0
+        paddingRight = 0
+        measured = 2
+        originalLabel = ""
+        originalPadding = 0
+        hiddenMode = false
+        outerPadding = 0
+    }
+
+    func length(font: NSFont) -> Double {
+        guard drawing else { return 0 }
+        if let width { return width }
+        func glyphWidth(_ text: String) -> Double {
+            guard !text.isEmpty else { return 2 }
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [.font: font]))
+            return CTLineGetBoundsWithOptions(line, .useGlyphPathBounds).width.rounded() + 2
+        }
+        let base = hiddenMode ? glyphWidth(originalLabel) + originalPadding : measured
+        return base + glyphWidth(label) - glyphWidth(originalLabel)
+            + paddingLeft + paddingRight - originalPadding + outerPadding
+    }
+}
+
+extension WorkspaceSnapshot {
+    static func affectsWidth(_ name: String) -> Bool {
+        name == "front" || name == "front.icon" || name == "mode" || (name.hasPrefix("ws.") && !name.hasSuffix(".pill"))
+    }
+
+    // Apply the snapshot to the measured items without publishing it. Only the workspace and front items
+    // can change the left edge here; all other commands leave their width alone.
+    func leftEdge(_ oldEdge: Double, queries: [ItemQuery], display: Int, font: NSFont) -> Double? {
+        let names = items.filter(Self.affectsWidth)
+        let found = Dictionary(uniqueKeysWithValues: queries.filter { names.contains($0.name) }.map { ($0.name, $0) })
+        guard names.allSatisfy({ found[$0]?.geometry != nil }) else { return nil }
+        var values = Dictionary(uniqueKeysWithValues: names.compactMap { name in
+            found[name].map { (name, WorkspaceFootprint($0, display: display)) }
+        })
+        let oldWidth = values.values.reduce(0) { $0 + $1.length(font: font) }
+        let arguments = add + now
+        var i = 0
+        while i < arguments.count {
+            switch arguments[i] {
+            case "--add" where i + 3 < arguments.count:
+                if arguments[i + 1] == "item", Self.affectsWidth(arguments[i + 2]) {
+                    values[arguments[i + 2]] = WorkspaceFootprint()
+                }
+                i += 4
+            case "--remove" where i + 1 < arguments.count:
+                let pattern = arguments[i + 1]
+                if pattern.first == "/", pattern.last == "/",
+                   let regex = try? NSRegularExpression(pattern: String(pattern.dropFirst().dropLast())) {
+                    for name in Array(values.keys) where regex.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil {
+                        values.removeValue(forKey: name)
+                    }
+                } else { values.removeValue(forKey: pattern) }
+                i += 2
+            case "--set" where i + 1 < arguments.count:
+                let name = arguments[i + 1]
+                i += 2
+                while i < arguments.count, !arguments[i].hasPrefix("--") {
+                    let parts = arguments[i].split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                    if parts.count == 2, var value = values[name] {
+                        let raw = String(parts[1])
+                        switch parts[0] {
+                        case "drawing": value.drawing = raw == "on"
+                        case "width": value.width = Double(raw)
+                        case "label": value.label = raw
+                        case "label.padding_left": value.paddingLeft = Double(raw) ?? value.paddingLeft
+                        case "label.padding_right": value.paddingRight = Double(raw) ?? value.paddingRight
+                        default: break
+                        }
+                        values[name] = value
+                    }
+                    i += 1
+                }
+            default: i += 1
+            }
+        }
+        return oldEdge + values.values.reduce(0) { $0 + $1.length(font: font) } - oldWidth
+    }
+}
+
+struct VolumeStatus: Equatable {
+    let percent: Int?
+    let muted: Bool
+
+    var barState: BarState { .volume(percent: percent, muted: muted) }
+    var label: String { percent.map { "\($0)%" } ?? "" }
+
+    func stagedIcon(_ value: String) -> String? {
+        let fields = value.split(separator: "|", omittingEmptySubsequences: false)
+        guard fields.count == 3, fields[0] == (percent.map(String.init) ?? "fixed"),
+              fields[1] == String(muted), !fields[2].isEmpty else { return nil }
+        return String(fields[2])
+    }
+}
+
 // What a bar item shows. Strings exist only in `variables`, at the sketchybar trigger boundary.
 enum BarState: Equatable {
     case volume(percent: Int?, muted: Bool)
@@ -99,8 +249,8 @@ enum BarState: Equatable {
         switch self {
         case .volume(let percent, let muted): ["VOLUME=\(percent.map(String.init) ?? "fixed")", "MUTED=\(muted)"]
         case .network(let kind): ["KIND=\(kind.rawValue)"]
-        case .media(let label, let width, let playing): ["MEDIA=\(playing ? "playing" : "paused")", "LABEL=\(label)", "WIDTH=\(width)"]
-        case .mediaUnavailable(let label, let width): ["MEDIA=unavailable", "LABEL=\(label)", "WIDTH=\(width)"]
+        case .media(let label, let width, let playing): ["MEDIA=\(playing ? "playing" : "paused")", "LABEL=\(label)", "WIDTH=\(width)", "COORDINATED=true"]
+        case .mediaUnavailable(let label, let width): ["MEDIA=unavailable", "LABEL=\(label)", "WIDTH=\(width)", "COORDINATED=true"]
         case .mediaProgress(let width): ["WIDTH=\(width)"]
         case .tailscale(let kind): ["KIND=\(kind.rawValue)"]
         case .system(let cpu, let memory, let cpuStrain, let memoryStrain, let diskStrain):
@@ -126,6 +276,8 @@ final class BarFeed {
     private var sampler = SystemSampler()
     private var primaryInterface: String?
     private(set) var system: SystemSample?
+    private(set) var volume: VolumeStatus?
+    var volumeChanged: (() -> Void)?
 
     init(sketchybar: URL) { self.sketchybar = sketchybar }
 
@@ -215,7 +367,12 @@ final class BarFeed {
     private func audioChanged() {
         let id = Audio.current
         if id != audioDevice { watch(id) }
-        publish(.volume(percent: Audio.volume(id).map { Int(($0 * 100).rounded()) }, muted: Audio.muted(id)))
+        let state = VolumeStatus(percent: Audio.volume(id).map { Int(($0 * 100).rounded()) }, muted: Audio.muted(id))
+        if volume != state {
+            volume = state
+            volumeChanged?()
+        }
+        publish(state.barState)
     }
 
     private func watch(_ device: AudioObjectID) {

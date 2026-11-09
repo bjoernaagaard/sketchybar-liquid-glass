@@ -105,9 +105,9 @@ final class Motion: NSObject {
 
     private var idle: Bool { drops.values.allSatisfy(\.settled) && popup?.settled != false }
 
-    // Points each island's edges at a new frame. An island seen for the first time, and every island while
-    // Reduce Motion is on, settles at once. Otherwise the springs keep their value and velocity.
-    func retarget(_ frames: [Island: NSRect], response: CGFloat) {
+    // Points each island at its new frame. Requested islands and Reduce Motion settle at once; other
+    // springs keep their value and velocity.
+    func retarget(_ frames: [Island: NSRect], response: CGFloat, immediately: Set<Island> = []) {
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         if reduceMotion { for island in Array(drops.keys) where drops[island]?.settled == false { settle(island) } }
         for (island, frame) in frames {
@@ -120,7 +120,10 @@ final class Motion: NSObject {
                 continue
             }
             guard abs(drop.minX.target - frame.minX) > 0.01 || abs(drop.maxX.target - frame.maxX) > 0.01
-                    || drop.minY != frame.minY || drop.height != frame.height else { continue }
+                    || drop.minY != frame.minY || drop.height != frame.height else {
+                if immediately.contains(island) && !drop.settled { settle(island) }
+                continue
+            }
             let from = drop.frame
             drop.minY = frame.minY
             drop.height = frame.height
@@ -129,13 +132,20 @@ final class Motion: NSObject {
             drop.maxX.target = frame.maxX
             motionLogger.debug("event=spring_retarget island=\(island.rawValue, privacy: .public) t=\(CACurrentMediaTime(), privacy: .public) from=\(Double(from.minX), privacy: .public),\(Double(from.maxX), privacy: .public) to=\(Double(frame.minX), privacy: .public),\(Double(frame.maxX), privacy: .public) response=\(Double(response), privacy: .public) reduce_motion=\(reduceMotion, privacy: .public)")
             drops[island] = drop
-            if reduceMotion || drop.settled {
+            if reduceMotion || immediately.contains(island) || drop.settled {
                 settle(island)
             } else if drop.interval == nil {
                 drops[island]?.interval = motionSignposter.beginInterval("spring", id: motionSignposter.makeSignpostID(),
                     "island=\(island.rawValue, privacy: .public) from_min=\(Double(from.minX), privacy: .public) from_max=\(Double(from.maxX), privacy: .public) to_min=\(Double(frame.minX), privacy: .public) to_max=\(Double(frame.maxX), privacy: .public) response=\(Double(response), privacy: .public)")
             }
         }
+        updateLink()
+    }
+
+    func hide(_ island: Island) {
+        endInterval(island)
+        drops.removeValue(forKey: island)
+        glass.hide(island)
         updateLink()
     }
 

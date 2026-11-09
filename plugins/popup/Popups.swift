@@ -129,9 +129,17 @@ final class Popups: NSObject, NSApplicationDelegate {
     var mediaDisplay: MediaDisplay?
 
     var mediaFitTask: Task<Void, Never>?
-    // The island width the last fit aims for, and the loop that moves the progress plate while a track plays.
-    var mediaIslandWidth: Double?
-
+    var workspaceTask: Task<Void, Never>?
+    var workspaceDirty = false
+    var workspaceRetry = 0
+    var layoutDirty = false
+    var layoutRevision = 0
+    var mediaStyle: MediaStyle?
+    var mediaVisibility: MediaVisibility = .visible
+    var volumeStageMismatch: (VolumeStatus, String)?
+    var colorAnimation: [String] = []
+    var layoutFrames: [Island: NSRect] = [:]
+    // The loop moves the progress plate while a track plays.
     var mediaProgressLoop: Task<Void, Never>?
     // The system popup shows the bar's latest sample and adds GPU and top processes while open.
     var systemShown: SystemSample?
@@ -146,6 +154,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         glass = GlassLayer(theme: theme)
         motion = Motion(glass: glass, content: panel)
         super.init()
+        bar.volumeChanged = { [weak self] in self?.requestLayout() }
     }
 
     var isOpen: Bool {
@@ -205,6 +214,7 @@ final class Popups: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 if kill(self.theme.barPID, 0) != 0 { NSApp.terminate(nil) }
+                if self.workspaceDirty && self.workspaceTask == nil { self.requestLayout() }
                 guard self.isOpen else { return }
                 switch self.item {
                 case .volume: self.refreshVolume()
@@ -226,11 +236,14 @@ final class Popups: NSObject, NSApplicationDelegate {
         bar.start()
         refreshIslands()
         startMediaStream()
+        // The bar can send its first update before distributed notifications are observed.
+        updateWorkspace(retry: 0)
         switch initialCommand {
         case .toggle(let source): show(source, requiresPointer: source.kind != .bluetooth)
         case .hover(let source): show(source)
         case .volumeScroll(let notches): scrollVolume(notches)
         case .media(let action): performMedia(action)
+        case .workspaceUpdate(let retry): updateWorkspace(retry: retry)
         case .geometry, .start, .hoverEnd, .stop: break
         }
     }
@@ -273,6 +286,8 @@ final class Popups: NSObject, NSApplicationDelegate {
         notchTask = nil
         mediaFitTask?.cancel()
         mediaFitTask = nil
+        workspaceTask?.cancel()
+        workspaceTask = nil
         islandsTask?.cancel()
         islandsTask = nil
         motion.stop()
@@ -306,6 +321,7 @@ final class Popups: NSObject, NSApplicationDelegate {
         case .stop: NSApp.terminate(nil)
         case .volumeScroll(let notches): scrollVolume(notches)
         case .geometry: geometryChanged()
+        case .workspaceUpdate(let retry): updateWorkspace(retry: retry)
         case .hover(let source): show(source)
         case .hoverEnd(let source):
             if lifecycle.target?.source.identity == source.identity { pointerMoved() }
@@ -330,11 +346,9 @@ final class Popups: NSObject, NSApplicationDelegate {
         }
     }
 
-    func geometryChanged() {
+    func geometryChanged(refitMedia: Bool = true) {
         refreshIslands()
-        // The islands retarget now. A workspace switch fires its workspace, focus and front-app events within a
-        // few milliseconds, so the media fit waits 50 ms for the last of them.
-        fitMedia(after: .milliseconds(50))
+        if refitMedia { fitMedia() }
         geometryGeneration += 1
         geometryTask?.cancel()
         geometryTask = nil

@@ -8,9 +8,7 @@ trap '[ ! -x "$CONFIG_DIR/plugins/.popup-helper" ] || "$CONFIG_DIR/plugins/.popu
 
 case "$NAME" in
   mode)
-    mode=$(aerospace list-modes --current)
-    if [ -z "$mode" ] || [ "$mode" = main ]; then $SB --set mode drawing=off
-    else $SB --set mode drawing=on label="$mode"; fi
+    exec "$CONFIG_DIR/plugins/.popup-helper" workspace-update 0
     ;;
 
   clock)
@@ -22,15 +20,13 @@ case "$NAME" in
     [ "$SENDER" = mouse.scrolled ] && exec "$CONFIG_DIR/plugins/.popup-helper" volume-scroll "$SCROLL_DELTA"
     # The resident helper pushes VOLUME and MUTED. Other events leave the item as it is.
     [ "$SENDER" = volume_state ] || exit 0
-    if [ "$VOLUME" = fixed ]; then
-      $SB --set volume icon=$'\xf4\x80\x8a\xa9' label=""
-      exit 0
-    fi
-    if [ "$MUTED" = true ] || [ "$VOLUME" -eq 0 ]; then icon=$'\xf4\x80\x8a\xa3'
+    if [ "$VOLUME" = fixed ]; then icon=$'\xf4\x80\x8a\xa9'
+    elif [ "$MUTED" = true ] || [ "$VOLUME" -eq 0 ]; then icon=$'\xf4\x80\x8a\xa3'
     elif [ "$VOLUME" -lt 34 ]; then icon=$'\xf4\x80\x8a\xa5'
     elif [ "$VOLUME" -lt 67 ]; then icon=$'\xf4\x80\x8a\xa7'
     else icon=$'\xf4\x80\x8a\xa9'; fi
-    $SB --set volume icon="$icon" label="${VOLUME}%"
+    # The fixed-width end anchor stages the glyph without changing q geometry.
+    $SB --set island.media.end label.drawing=off label="${VOLUME}|${MUTED}|${icon}"
     ;;
 
   battery)
@@ -47,9 +43,11 @@ case "$NAME" in
     ;;
 
   media)
-    # The resident helper pushes MEDIA, LABEL, and WIDTH. It fits the label to the media item, and the
-    # item to the gap between the left island and the notch.
+    # The helper publishes the label, width, and progress with the workspace layout.
+    # This event changes only colors and icons, so it does not need another geometry pass.
+    trap - EXIT
     [ "$SENDER" = media_state ] || exit 0
+    [ "${COORDINATED:-}" != true ] || exit 0
     # The media item shows a note, and media.toggle shows the play state.
     # SF Pro music.note U+10046A, verified in SF-Pro.ttf as glyph 15101.
     # SF Pro play.fill U+100284 and pause.fill U+100286, verified in SF-Pro.ttf as glyphs 14741 and 14783.
@@ -61,8 +59,6 @@ case "$NAME" in
                            --set media.toggle icon="$toggle" icon.color=$toggle_color \
                            --set media.prev icon=$'\xf4\x80\x8a\x8a' icon.color=$skip \
                            --set media.next icon=$'\xf4\x80\x8a\x8c' icon.color=$skip
-    # The width changes at once. The helper's springs move the island glass to it.
-    $SB --set media width="$WIDTH" label="$LABEL"
     ;;
 
   media.progress)

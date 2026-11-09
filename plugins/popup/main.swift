@@ -48,6 +48,9 @@ if arguments.count > 2 && arguments[1] == "volume-scroll" {
     runCLI { try await Media.perform(action) }
 } else if arguments.count > 1 && arguments[1] == PopupCommand.geometry.rawValue {
     PopupCommand.geometry.post()
+} else if arguments.count > 2 && arguments[1] == "workspace-update" {
+    guard let command = PopupCommand(arguments[1], argument: arguments[2]) else { exit(EXIT_FAILURE) }
+    command.post()
 } else if arguments.count > 1 && arguments[1] == PopupCommand.stop.rawValue {
     PopupCommand.stop.post()
     // sketchybarrc starts a helper right after this. Wait up to 2 s for the running one to

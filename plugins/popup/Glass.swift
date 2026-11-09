@@ -104,6 +104,8 @@ final class GlassLayer {
         }
     }
 
+    func hide(_ island: Island) { drops[island]?.isHidden = true }
+
     // Where an island's drop is on screen now.
     func frame(of island: Island) -> NSRect? {
         guard let drop = drops[island], !drop.isHidden else { return nil }

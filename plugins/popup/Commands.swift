@@ -94,6 +94,7 @@ enum PopupLifecycle {
 enum PopupCommand {
     case toggle(PopupSource), hover(PopupSource), hoverEnd(PopupSource), geometry, start, stop, volumeScroll(notches: Int)
     case media(MediaAction)
+    case workspaceUpdate(retry: Int)
 
     init?(_ raw: String, argument: String? = nil) {
         switch raw {
@@ -105,6 +106,9 @@ enum PopupCommand {
             guard let argument, let source = PopupSource(rawValue: argument) else { return nil }
             self = raw == "hover" ? .hover(source) : .hoverEnd(source)
         case "geometry": self = .geometry
+        case "workspace-update":
+            guard let argument, let retry = Int(argument), (0...30).contains(retry) else { return nil }
+            self = .workspaceUpdate(retry: retry)
         case "start": self = .start
         case "stop": self = .stop
         default:
@@ -120,6 +124,7 @@ enum PopupCommand {
         case .hover: "hover"
         case .hoverEnd: "hover-end"
         case .geometry: "geometry"
+        case .workspaceUpdate: "workspace-update"
         case .start: "start"
         case .stop: "stop"
         case .volumeScroll: "volume-scroll"
@@ -130,6 +135,7 @@ enum PopupCommand {
     var userInfo: [String: String] {
         switch self {
         case .volumeScroll(let notches): ["item": rawValue, "argument": String(notches)]
+        case .workspaceUpdate(let retry): ["item": rawValue, "argument": String(retry)]
         case .hover(let source), .hoverEnd(let source): ["item": rawValue, "argument": source.rawValue]
         case .toggle, .geometry, .start, .stop, .media: ["item": rawValue]
         }

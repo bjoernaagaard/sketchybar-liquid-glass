@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 
 enum MediaError: LocalizedError {
     case missingCLI
@@ -168,6 +169,10 @@ struct Media {
 
 }
 
+enum MediaStyle: Equatable {
+    case unavailable, playing, paused
+}
+
 // What the media item shows, before it is fitted to the island.
 enum MediaDisplay: Equatable {
     case unavailable
@@ -175,6 +180,13 @@ enum MediaDisplay: Equatable {
 
     init(_ snapshot: MediaSnapshot?) {
         self = .track(title: snapshot?.title ?? "", artist: snapshot?.artist ?? "", playing: snapshot?.playing ?? false)
+    }
+
+    var style: MediaStyle {
+        switch self {
+        case .unavailable: .unavailable
+        case .track(_, _, let playing): playing ? .playing : .paused
+        }
     }
 
     var text: String {
@@ -192,6 +204,11 @@ enum MediaDisplay: Equatable {
     }
 }
 
+struct VolumeUpdate {
+    let icon: String
+    let label: String
+}
+
 // Measured positions, in points. None of them depends on the media item's own width: SketchyBar
 // keeps q positions in unsigned integers, so an item wider than the space left of the notch wraps
 // to the far end of the bar, and a fit based on its position could never shrink it back.
@@ -201,9 +218,53 @@ struct MediaLayout {
     let islandEnd: Double      // island.media.end right edge, which SketchyBar pins at notch.gap
     let startWidth: Double     // island.media.start, the island's padding before the media item
     let reserved: Double       // icon padding, glyph, and label padding: what the title cannot use
+    let controlsVisible: Bool
+    let footprint: MediaFootprint
+    let volumeUpdate: VolumeUpdate?
+    let leftFrame: NSRect
+    let mediaFrame: NSRect
 
     // The island runs from the gap after the left island to its pinned end, once the fit has settled.
     func islandWidth(gap: Double) -> Double { islandEnd - (leftEdge + gap) }
+}
+
+// Keep the measured fixed footprint when its items are hidden and no longer have bounds.
+struct MediaFootprint {
+    let width: Double
+    let volumeIcon: String
+
+    init(width: Double, volumeIcon: String) {
+        self.width = width
+        self.volumeIcon = volumeIcon
+    }
+
+    init?(_ stored: String) {
+        let fields = stored.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+        guard fields.count == 2, let width = Double(fields[0]), width.isFinite, width >= 0 else { return nil }
+        self.init(width: width, volumeIcon: String(fields[1]))
+    }
+
+    var stored: String { "\(width)|\(volumeIcon)" }
+
+    func width(volumeIcon: String, font: NSFont) -> Double {
+        guard volumeIcon != self.volumeIcon else { return width }
+        func glyphWidth(_ icon: String) -> Double {
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: icon, attributes: [.font: font]))
+            return CTLineGetBoundsWithOptions(line, .useGlyphPathBounds).width.rounded()
+        }
+        return width + glyphWidth(volumeIcon) - glyphWidth(self.volumeIcon)
+    }
+}
+
+// The whole island must fit before any q-position content is drawn.
+enum MediaVisibility: Equatable {
+    case hidden
+    case visible
+
+    init(layout: MediaLayout, gap: Double) {
+        let boundary = layout.leftEdge + gap + layout.startWidth
+        self = layout.rightEdge >= boundary && layout.rightEdge <= layout.islandEnd ? .visible : .hidden
+    }
 }
 
 // The media item's width and title. The island's right edge is pinned by SketchyBar, so the item
@@ -213,9 +274,9 @@ struct MediaFit: Equatable {
     let label: String
 
     init(text: String, layout: MediaLayout, gap: Double, font: NSFont) {
-        let fitted = layout.rightEdge - (layout.leftEdge + gap + layout.startWidth)
-        width = max(Int(layout.reserved.rounded(.up)), Int(fitted.rounded(.down)))
-        let available = Double(width) - layout.reserved
+        let fitted = min(layout.rightEdge, layout.islandEnd) - (layout.leftEdge + gap + layout.startWidth)
+        width = max(0, Int(fitted.rounded(.down)))
+        let available = max(0, Double(width) - layout.reserved)
         func measure(_ string: String) -> Double { Double((string as NSString).size(withAttributes: [.font: font]).width.rounded(.up)) }
         guard measure(text) > available else { label = text; return }
         // Largest prefix whose width, with an ellipsis, fits. Width grows with the prefix.

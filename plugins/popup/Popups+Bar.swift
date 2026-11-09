@@ -1,6 +1,128 @@
 import AppKit
 
 extension Popups {
+    // One worker owns both workspace and media writes. A newer event invalidates every in-flight read;
+    // a write already sent to SketchyBar finishes before the worker starts the next snapshot.
+    func updateWorkspace(retry: Int) {
+        workspaceRetry = retry
+        workspaceDirty = true
+        requestLayout()
+    }
+
+    func requestLayout() {
+        layoutRevision += 1
+        layoutDirty = true
+        guard workspaceTask == nil else { return }
+        workspaceTask = Task { [weak self] in
+            while !Task.isCancelled, let self, self.layoutDirty {
+                self.layoutDirty = false
+                let revision = self.layoutRevision
+                let needsWorkspace = self.workspaceDirty
+                self.workspaceDirty = false
+                var snapshot: WorkspaceSnapshot?
+                do {
+                    if needsWorkspace {
+                        let script = URL(fileURLWithPath: self.theme.configDirectory + "/plugins/spaces.sh")
+                        let result = try await ProcessCapture().run(URL(fileURLWithPath: "/bin/bash"),
+                                                                    [script.path, "--snapshot", String(self.workspaceRetry)])
+                        if result.status == 75 { self.workspaceDirty = true; self.layoutDirty = true; continue }
+                        guard result.status == 0, let decoded = try? JSONDecoder().decode(WorkspaceSnapshot.self, from: result.output) else {
+                            logger.error("Workspace snapshot failed with status \(result.status, privacy: .public)")
+                            continue
+                        }
+                        snapshot = decoded
+                    }
+                    guard let layout = await self.mediaLayout(workspace: snapshot) else {
+                        if needsWorkspace { self.workspaceDirty = true }
+                        logger.error("Could not measure the workspace and media layout.")
+                        continue
+                    }
+                    guard !Task.isCancelled, revision == self.layoutRevision else {
+                        if needsWorkspace { self.workspaceDirty = true }
+                        continue
+                    }
+                    let display = self.mediaDisplay ?? .unavailable
+                    let gap = Double(self.theme.number("ISLAND_GAP"))
+                    let visibility = MediaVisibility(layout: layout, gap: gap)
+                    let visibilityChanged = visibility != (layout.controlsVisible ? .visible : .hidden)
+                    let fit = MediaFit(text: display.text, layout: layout, gap: gap, font: self.theme.font)
+                    let islandWidth = visibility == .visible ? max(0, layout.islandWidth(gap: gap)) : 0
+                    let inset = Double(self.theme.number("PROGRESS_INSET"))
+                    let progress: Int
+                    if case .track = display, let timing = self.streamedMedia?.timing {
+                        progress = max(0, Int((max(0, islandWidth - 2 * inset) * timing.elapsed / timing.duration).rounded(.down)))
+                    } else { progress = 0 }
+                    let radius = min(progress / 2, max(0, Int(self.theme.number("ISLAND_RADIUS") - self.theme.number("PROGRESS_INSET"))))
+                    var arguments = (snapshot?.add ?? []) + (snapshot?.now ?? [])
+                    let mediaContent = Double(fit.width) >= layout.reserved ? "on" : "off"
+                    let drawing = visibility == .visible ? "on" : "off"
+                    arguments += ["--set", "island.media.end", "icon.drawing=off", "icon=\(layout.footprint.stored)"]
+                    for item in ["island.media.start", "media", "media.prev", "media.toggle", "media.next", "volume"] {
+                        arguments += ["--set", item, "drawing=\(drawing)"]
+                    }
+                    arguments += ["--set", "media", "width=\(visibility == .visible ? fit.width : 0)", "label=\(fit.label)",
+                                  "icon.drawing=\(mediaContent)", "label.drawing=\(mediaContent)"]
+                    if let volume = layout.volumeUpdate {
+                        arguments += ["--set", "volume", "icon=\(volume.icon)", "label=\(volume.label)"]
+                    }
+                    if progress > 0 {
+                        arguments += ["--set", "media.progress", "drawing=on", "label.width=\(progress)",
+                                      "padding_right=-\(Int(gap + inset) + progress)", "background.corner_radius=\(radius)"]
+                    } else { arguments += ["--set", "media.progress", "drawing=off"] }
+                    arguments += snapshot?.animation ?? []
+                    if self.mediaStyle != display.style {
+                        let environment = ProcessInfo.processInfo.environment
+                        guard let text = environment["TEXT"], let text2 = environment["TEXT2"], let text3 = environment["TEXT3"] else {
+                            logger.error("Media colors are missing from the helper environment.")
+                            continue
+                        }
+                        let note: String, toggle: String, toggleColor: String, skip: String
+                        switch display.style {
+                        case .unavailable: note = text3; toggle = "\u{100284}"; toggleColor = text3; skip = text3
+                        case .playing: note = text2; toggle = "\u{100286}"; toggleColor = text; skip = text2
+                        case .paused: note = text3; toggle = "\u{100284}"; toggleColor = text2; skip = text2
+                        }
+                        arguments += snapshot?.colorAnimation ?? self.colorAnimation
+                        arguments += ["--set", "media", "icon=\u{10046A}", "icon.color=\(note)",
+                                      "--set", "media.toggle", "icon=\(toggle)", "icon.color=\(toggleColor)",
+                                      "--set", "media.prev", "icon=\u{10028A}", "icon.color=\(skip)",
+                                      "--set", "media.next", "icon=\u{10028C}", "icon.color=\(skip)"]
+                    }
+                    var frames: [Island: NSRect] = [.left: layout.leftFrame]
+                    if visibility == .visible { frames[.media] = layout.mediaFrame }
+                    let moved = snapshot != nil || frames != self.layoutFrames || visibilityChanged || visibility != self.mediaVisibility
+                    let result = try await ProcessCapture().run(URL(fileURLWithPath: self.theme.sketchybarPath), arguments)
+                    guard result.status == 0 else {
+                        if needsWorkspace { self.workspaceDirty = true }
+                        self.refreshIslands()
+                        logger.error("Coordinated bar update failed with status \(result.status, privacy: .public)")
+                        continue
+                    }
+                    if moved {
+                        self.islandsTask?.cancel()
+                        self.mediaVisibility = visibility
+                        if visibility == .hidden { self.motion.hide(.media) }
+                        self.motion.retarget(frames, response: self.theme.number("SPRING_RESIZE"), immediately: [.left, .media])
+                    }
+                    self.mediaStyle = display.style
+                    self.layoutFrames = frames
+                    if let snapshot { self.colorAnimation = snapshot.colorAnimation }
+                    guard revision == self.layoutRevision else { continue }
+                    self.bar.publish(display.state(fit))
+                    if moved { self.geometryChanged(refitMedia: false) }
+                    if (visibilityChanged && visibility == .visible) || layout.volumeUpdate != nil { self.requestLayout() }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    if needsWorkspace { self.workspaceDirty = true }
+                    self.refreshIslands()
+                    logger.error("Coordinated bar update failed: \(error.localizedDescription, privacy: .private)")
+                }
+            }
+            self?.workspaceTask = nil
+        }
+    }
+
     func startMediaStream() {
         guard mediaStream == nil else { return }
         mediaStream = Task { [weak self] in
@@ -38,17 +160,8 @@ extension Popups {
         syncMediaProgress()
     }
 
-    // The plate fills the island, less the inset on each side, in proportion to the elapsed time. The stream
-    // reports pauses, seeks, and track changes, which push at once. While a timed track plays, a loop pushes
-    // every 2 s. `publish` skips a width the bar already has.
-    func pushMediaProgress() {
-        guard case .track? = mediaDisplay, let timing = streamedMedia?.timing, let island = mediaIslandWidth else {
-            bar.publish(.mediaProgress(0))
-            return
-        }
-        let track = island - 2 * Double(theme.number("PROGRESS_INSET"))
-        bar.publish(.mediaProgress(max(0, Int((track * timing.elapsed / timing.duration).rounded(.down)))))
-    }
+    // The worker publishes progress together with the media width it was calculated from.
+    func pushMediaProgress() { requestLayout() }
 
     func syncMediaProgress() {
         pushMediaProgress()
@@ -64,20 +177,13 @@ extension Popups {
         }
     }
 
-    // Measures the gap between the left island and the media island, then pushes the width and title that
-    // fill it. `publish` skips a state the bar already has, so a refit that changes nothing ends here and
-    // the geometry call that status.sh makes after the push does not loop.
     func fitMedia(after delay: Duration = .zero) {
         mediaFitTask?.cancel()
+        if delay == .zero { requestLayout(); return }
         mediaFitTask = Task { [weak self] in
-            if delay > .zero { try? await Task.sleep(for: delay) }
-            guard !Task.isCancelled, let layout = await self?.mediaLayout(), !Task.isCancelled, let self,
-                  let display = self.mediaDisplay else { return }
-            let gap = Double(self.theme.number("ISLAND_GAP"))
-            let fit = MediaFit(text: display.text, layout: layout, gap: gap, font: self.theme.font)
-            self.mediaIslandWidth = layout.islandWidth(gap: gap)
-            self.bar.publish(display.state(fit))
-            self.pushMediaProgress()
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            self?.requestLayout()
         }
     }
 
@@ -91,7 +197,7 @@ extension Popups {
             guard !Task.isCancelled, let self else { return }
             if remeasureDisplay { self.displayIndex = nil }
             guard let frames = await self.queryIslands(), !Task.isCancelled else { return }
-            self.motion.retarget(frames, response: self.theme.number("SPRING_RESIZE"))
+            self.motion.retarget(frames, response: self.theme.number("SPRING_RESIZE"), immediately: [.left, .media])
         }
     }
 
@@ -99,36 +205,95 @@ extension Popups {
     func queryIslands() async -> [Island: NSRect]? {
         guard let screen = NSScreen.screens.first, let index = await barDisplayIndex(),
               let result = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath),
-                                                           Island.allCases.flatMap { ["--query", $0.rawValue] }),
+                                                           (Island.allCases.map(\.rawValue) + ["media.prev"]).flatMap { ["--query", $0] }),
               !Task.isCancelled, result.status == 0 else { return nil }
+        let queries = ItemQuery.decodeAll(result.output)
+        let mediaDrawn = queries.first(where: { $0.name == "media.prev" })?.geometry?.drawing == "on"
+        if !mediaDrawn { motion.hide(.media) }
         var frames: [Island: NSRect] = [:]
-        for query in ItemQuery.decodeAll(result.output) {
-            if let island = Island(rawValue: query.name), let frame = query.frame(display: index, on: screen) { frames[island] = frame }
+        for query in queries {
+            if let island = Island(rawValue: query.name), (island != .media || (mediaVisibility == .visible && mediaDrawn)),
+               let frame = query.frame(display: index, on: screen) { frames[island] = frame }
         }
         return frames.isEmpty ? nil : frames
     }
 
-    func queryItem(_ name: String) async -> ItemQuery? {
-        guard let result = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath), ["--query", name]),
+    func mediaLayout(workspace: WorkspaceSnapshot? = nil) async -> MediaLayout? {
+        let names = ["half.left", "media.prev", "media.toggle", "media.next", "island.media.start", "island.media.end", "media", "volume"]
+            + (workspace?.items.filter(WorkspaceSnapshot.affectsWidth) ?? [])
+        guard let screen = NSScreen.screens.first, let index = await barDisplayIndex(),
+              let result = try? await ProcessCapture().run(URL(fileURLWithPath: theme.sketchybarPath),
+                                                           names.flatMap { ["--query", $0] }),
               !Task.isCancelled, result.status == 0 else { return nil }
-        return try? JSONDecoder().decode(ItemQuery.self, from: result.output)
-    }
-
-    func mediaLayout() async -> MediaLayout? {
-        guard let index = await barDisplayIndex(),
-              let left = await queryItem("half.left"), let prev = await queryItem("media.prev"),
-              let start = await queryItem("island.media.start"), let end = await queryItem("island.media.end"),
-              let media = await queryItem("media"), !Task.isCancelled,
-              let leftBounds = left.bounds(display: index), let prevBounds = prev.bounds(display: index),
-              let startBounds = start.bounds(display: index), let endBounds = end.bounds(display: index),
+        let items = ItemQuery.decodeAll(result.output)
+        guard let left = items.first(where: { $0.name == "half.left" }),
+              let prev = items.first(where: { $0.name == "media.prev" }),
+              let start = items.first(where: { $0.name == "island.media.start" }),
+              let end = items.first(where: { $0.name == "island.media.end" }),
+              let media = items.first(where: { $0.name == "media" }),
+              let volume = items.first(where: { $0.name == "volume" }),
+              let leftBounds = left.bounds(display: index), let leftFrame = left.frame(display: index, on: screen),
+              let startWidth = start.geometry?.width, startWidth >= 0,
+              let endBounds = end.bounds(display: index),
+              let volumeIcon = volume.icon, let volumeLabel = volume.label,
               let icon = media.icon, let label = media.label else { return nil }
+        let volumeUpdate: VolumeUpdate?
+        if let state = bar.volume, let stagedIcon = end.label.flatMap({ state.stagedIcon($0.value) }) {
+            volumeStageMismatch = nil
+            volumeUpdate = stagedIcon != volumeIcon.value || state.label != volumeLabel.value
+                ? VolumeUpdate(icon: stagedIcon, label: state.label) : nil
+        } else {
+            volumeUpdate = nil
+            if let state = bar.volume {
+                let staged = end.label?.value ?? ""
+                if volumeStageMismatch?.0 != state || volumeStageMismatch?.1 != staged {
+                    volumeStageMismatch = (state, staged)
+                    bar.publish(state.barState, force: true)
+                }
+            }
+        }
         // q items fill leftward from the notch: notch.gap, island.media.end, volume, media.next, media.toggle,
         // media.prev, then media. So media.prev's left edge is where media must end, whatever media's width is
         // now. Measure only items nearer the notch than media.
-        let glyph = (icon.value as NSString).size(withAttributes: [.font: theme.iconFont]).width.rounded(.up)
-        return MediaLayout(leftEdge: leftBounds.minX + leftBounds.width, rightEdge: prevBounds.minX,
-                           islandEnd: endBounds.minX + endBounds.width, startWidth: startBounds.width,
-                           reserved: icon.paddingLeft + Double(glyph) + icon.paddingRight + label.paddingLeft + label.paddingRight)
+        let glyph = ("\u{10046A}" as NSString).size(withAttributes: [.font: theme.iconFont]).width.rounded(.up)
+        let oldEdge = leftBounds.minX + leftBounds.width
+        let leftEdge: Double
+        if let workspace {
+            guard let predicted = workspace.leftEdge(oldEdge, queries: items, display: index, font: theme.font) else { return nil }
+            leftEdge = predicted
+        } else { leftEdge = oldEdge }
+        let islandEnd = endBounds.minX + endBounds.width
+        let rightEdge: Double
+        let footprint: MediaFootprint
+        let controlsVisible = prev.geometry?.drawing == "on"
+        if controlsVisible {
+            let width: Double
+            if let prevBounds = prev.bounds(display: index), prevBounds.minX >= 0, prevBounds.minX <= islandEnd {
+                width = islandEnd - prevBounds.minX
+            } else {
+                let controls = ["media.prev", "media.toggle", "media.next", "volume"]
+                let widths = controls.compactMap { name in items.first(where: { $0.name == name })?.bounds(display: index)?.width }
+                guard widths.count == controls.count else { return nil }
+                width = endBounds.width + widths.reduce(0, +)
+            }
+            footprint = MediaFootprint(width: width, volumeIcon: volumeIcon.value)
+            let targetWidth = volumeUpdate.map { footprint.width(volumeIcon: $0.icon, font: theme.iconFont) } ?? width
+            rightEdge = islandEnd - targetWidth
+        } else {
+            guard let stored = end.icon?.value, let measured = MediaFootprint(stored) else { return nil }
+            footprint = measured
+            rightEdge = islandEnd - footprint.width(volumeIcon: volumeUpdate?.icon ?? volumeIcon.value, font: theme.iconFont)
+        }
+        let gap = Double(theme.number("ISLAND_GAP"))
+        let targetLeft = NSRect(x: leftFrame.minX, y: leftFrame.minY,
+                                width: max(0, leftEdge - leftBounds.minX), height: leftFrame.height)
+        let targetMedia = NSRect(x: screen.frame.minX + leftEdge + gap, y: leftFrame.minY,
+                                 width: max(0, islandEnd - leftEdge - gap), height: leftFrame.height)
+        return MediaLayout(leftEdge: leftEdge, rightEdge: rightEdge,
+                           islandEnd: islandEnd, startWidth: startWidth,
+                           reserved: icon.paddingLeft + Double(glyph) + icon.paddingRight + label.paddingLeft + label.paddingRight,
+                           controlsVisible: controlsVisible, footprint: footprint, volumeUpdate: volumeUpdate,
+                           leftFrame: targetLeft, mediaFrame: targetMedia)
     }
 
     // SketchyBar's arrangement index of the main display, which names the key in `bounding_rects`.

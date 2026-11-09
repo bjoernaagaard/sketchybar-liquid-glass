@@ -2,19 +2,25 @@
 # Redraws every workspace pill and the front app from one AeroSpace snapshot.
 source "$CONFIG_DIR/theme.sh"
 
-focused=${FOCUSED_WORKSPACE:-$(aerospace list-workspaces --focused)}
+# The resident helper coordinates workspace and media updates.
+if [ "${1:-}" != --snapshot ]; then
+  exec "$CONFIG_DIR/plugins/.popup-helper" workspace-update "${SPACES_RETRY:-0}"
+fi
+
+focused=$(aerospace list-workspaces --focused)
 windows=$(aerospace list-windows --all --format '%{workspace}|%{app-bundle-id}')
 IFS='|' read -r front_id front_name < <(aerospace list-windows --focused --format '%{app-bundle-id}|%{app-name}' 2>/dev/null)
 workspaces=$(aerospace list-workspaces --all 2>/dev/null)
+mode=$(aerospace list-modes --current 2>/dev/null)
 
 # AeroSpace may send no event when it starts after the bar, so one chain asks again every 2 s
 # for up to a minute. The directory marks a running chain, so other events don't start more.
 pending="${TMPDIR:-/tmp}/sketchybar-spaces-retry"
-retry=${SPACES_RETRY:-0}
+retry=${2:-0}
 if [ -n "$workspaces" ]; then
   rmdir "$pending" 2>/dev/null
-elif [ -n "${SPACES_RETRY:-}" ] || mkdir "$pending" 2>/dev/null; then
-  if [ "$retry" -lt 30 ]; then (sleep 2; $SB --trigger aerospace_focus_change SPACES_RETRY=$((retry + 1))) &
+elif [ "$retry" -gt 0 ] || mkdir "$pending" 2>/dev/null; then
+  if [ "$retry" -lt 30 ]; then (sleep 2; $SB --trigger aerospace_focus_change SPACES_RETRY=$((retry + 1))) >/dev/null 2>&1 &
   else rmdir "$pending" 2>/dev/null; fi
 fi
 
@@ -59,10 +65,9 @@ for ws in $workspaces; do
 done
 if [ ${#add[@]} -gt 0 ]; then
   for item in "${order[@]}"; do add+=(--move "$item" before mode); done
-  $SB "${add[@]}"
 fi
 
-# Images, visibility, text and sizes change at once; the helper's springs move the glass to the new sizes.
+# Collect images, visibility, text, and sizes for the helper to publish together.
 now=()
 grow=()    # icons that were hidden: they start small and grow
 reduce_motion=
@@ -118,12 +123,27 @@ for ws in $workspaces; do
   done
 done
 
+if [ -z "$mode" ] || [ "$mode" = main ]; then now+=(--set mode drawing=off)
+else now+=(--set mode drawing=on label="$mode"); fi
+
 if [ -n "$front_id" ]; then
   now+=(--set front.icon drawing=on background.image="app.$front_id" --set front label="$front_name")
 else
   now+=(--set front.icon drawing=off --set front label="Desktop")
 fi
 
-$SB "${now[@]}"
-$SB "${COLOR_ANIM[@]}" "${grow[@]}" "${colors[@]}"
-[ ! -x "$CONFIG_DIR/plugins/.popup-helper" ] || "$CONFIG_DIR/plugins/.popup-helper" geometry
+# Reject a snapshot if the workspace list, windows, focus, or front app changed while it was built.
+current_focused=$(aerospace list-workspaces --focused)
+current_windows=$(aerospace list-windows --all --format '%{workspace}|%{app-bundle-id}')
+current_workspaces=$(aerospace list-workspaces --all 2>/dev/null)
+current_mode=$(aerospace list-modes --current 2>/dev/null)
+IFS='|' read -r current_id current_name < <(aerospace list-windows --focused --format '%{app-bundle-id}|%{app-name}' 2>/dev/null)
+[ "$focused" = "$current_focused" ] && [ "$windows" = "$current_windows" ] && [ "$workspaces" = "$current_workspaces" ] && [ "$mode" = "$current_mode" ] &&
+  [ "$front_id" = "$current_id" ] && [ "$front_name" = "$current_name" ] || exit 75
+
+# Return commands to the resident helper, which combines them with the media layout.
+json_array() { jq -cn '$ARGS.positional' --args -- "$@"; }
+jq -cn --argjson add "$(json_array "${add[@]}")" --argjson now "$(json_array "${now[@]}")" \
+  --argjson animation "$(json_array "${COLOR_ANIM[@]}" "${grow[@]}" "${colors[@]}")" \
+  --argjson colorAnimation "$(json_array "${COLOR_ANIM[@]}")" \
+  --argjson bar "$bar" '{add: $add, now: $now, animation: $animation, colorAnimation: $colorAnimation, items: $bar.items}'
