@@ -1,5 +1,13 @@
 import AppKit
 
+// The first executable with this name on PATH, as the shell would find it.
+func executableOnPath(_ name: String) -> URL? {
+    (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
+        .map { "\($0)/\(name)" }
+        .first { FileManager.default.isExecutableFile(atPath: $0) }
+        .map { URL(fileURLWithPath: $0) }
+}
+
 // Owns the child and both pipes until their EOFs and termination have arrived.
 final class ProcessCapture {
     nonisolated enum Event: Sendable {

@@ -122,11 +122,8 @@ struct Tailscale: Equatable {
     let prefs: TailscalePrefs
 
     static func executable() throws(TailscaleError) -> URL {
-        let paths = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
-        guard let path = paths.map({ "\($0)/tailscale" }).first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            throw .missingCLI
-        }
-        return URL(fileURLWithPath: path)
+        guard let url = executableOnPath("tailscale") else { throw .missingCLI }
+        return url
     }
 
     // The CLI warns on stderr when it and the daemon differ by a patch version.

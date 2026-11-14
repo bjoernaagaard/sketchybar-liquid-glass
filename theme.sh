@@ -65,8 +65,8 @@ PROGRESS_INSET=2
 PROGRESS_HEIGHT=26
 PROGRESS_RADIUS=10
 
-# Native popups draw on system glass (NSGlassEffectView) with no size animation, like the islands.
-# Each width is the widest fixed row in SF Pro Semibold 13 plus POPUP_PADDING * 2. Text of any length (track titles,
+# Native popups draw on system glass (NSGlassEffectView). They grow out of their pill on SPRING_EMERGE and are
+# drawn back in on SPRING_RETRACT. Each width is the widest fixed row in SF Pro Semibold 13 plus POPUP_PADDING * 2. Text of any length (track titles,
 # device names, event titles) truncates, so a width only keeps the common case whole. Bash 3.2 has no associative
 # arrays, so each kind has its own variable. Battery, workspace and mode share INFORMATION.
 POPUP_RADIUS=12

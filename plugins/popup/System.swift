@@ -83,7 +83,7 @@ struct ProcessLoad {
 }
 
 // Unprivileged public reads. Unsafe Mach, sysctl, getifaddrs, IOKit, and libproc access stays here.
-struct SystemRead {
+enum SystemRead {
     static let host = mach_host_self()
 
     static func number<T: BitwiseCopyable>(_ name: String, _ initial: T) -> T? {

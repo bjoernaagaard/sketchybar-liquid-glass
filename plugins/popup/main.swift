@@ -15,15 +15,6 @@ private enum PopupRuntime {
     }()
 }
 
-func runCLI(_ operation: @escaping () async throws -> Void) -> Never {
-    Task {
-        do { try await operation(); exit(EXIT_SUCCESS) }
-        catch { logger.error("Command failed: \(error.localizedDescription, privacy: .private)"); exit(EXIT_FAILURE) }
-    }
-    RunLoop.main.run()
-    exit(EXIT_FAILURE)
-}
-
 let arguments = CommandLine.arguments
 if arguments.count > 2 && arguments[1] == "volume-scroll" {
     // Concurrent launches would overwrite each other's volume, so the resident helper applies every notch.
@@ -40,12 +31,6 @@ if arguments.count > 2 && arguments[1] == "volume-scroll" {
     let size = Notch.main.map { ["width": Int($0.width.rounded()), "height": Int($0.height.rounded())] }
     let data = try JSONEncoder().encode(size)
     print(String(decoding: data, as: UTF8.self))
-} else if arguments.count > 2 && arguments[1] == "media" {
-    guard let action = MediaAction(rawValue: arguments[2]) else {
-        logger.error("Unknown media command: \(arguments[2])")
-        exit(EXIT_FAILURE)
-    }
-    runCLI { try await Media.perform(action) }
 } else if arguments.count > 1 && arguments[1] == PopupCommand.geometry.rawValue {
     PopupCommand.geometry.post()
 } else if arguments.count > 2 && arguments[1] == "workspace-update" {
@@ -75,7 +60,10 @@ if arguments.count > 2 && arguments[1] == "volume-scroll" {
     DistributedNotificationCenter.default().addObserver(delegate, selector: #selector(Popups.receive(_:)), name: Popups.notification, object: nil)
     // Lock the existing source inode, not a scratch file. The kernel releases it on exit.
     delegate.lock = open(delegate.theme.configDirectory + "/plugins/popup/main.swift", O_RDONLY)
-    guard delegate.lock >= 0 else { exit(1) }
+    guard delegate.lock >= 0 else {
+        logger.error("Opening the helper lock failed: \(String(cString: strerror(errno)), privacy: .public)")
+        exit(EXIT_FAILURE)
+    }
     if flock(delegate.lock, LOCK_EX | LOCK_NB) != 0 {
         command.post()
         exit(0)

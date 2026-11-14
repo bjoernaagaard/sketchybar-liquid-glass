@@ -2,7 +2,7 @@ import AppKit
 import CoreAudio
 
 // System frameworks only. This process owns popups, never another bar.
-struct Audio {
+enum Audio {
     static let system = AudioObjectID(kAudioObjectSystemObject)
 
     static func address(_ selector: AudioObjectPropertySelector,

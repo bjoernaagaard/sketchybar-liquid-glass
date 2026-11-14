@@ -17,8 +17,8 @@ enum MediaError: LocalizedError {
     }
 }
 
-enum MediaAction: String, CaseIterable {
-    case playPause = "play-pause", next, previous
+enum MediaAction: CaseIterable {
+    case playPause, next, previous
 
     // The bar controls call popup.sh with these names. They cross the shell boundary only here.
     var command: String {
@@ -122,13 +122,10 @@ struct MediaSnapshot: Decodable, Equatable {
     }
 }
 
-struct Media {
+enum Media {
     static func executable() throws(MediaError) -> URL {
-        let paths = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
-        guard let path = paths.map({ "\($0)/media-control" }).first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            throw .missingCLI
-        }
-        return URL(fileURLWithPath: path)
+        guard let url = executableOnPath("media-control") else { throw .missingCLI }
+        return url
     }
 
     static func read(artwork: Bool = false) async throws -> MediaSnapshot? {

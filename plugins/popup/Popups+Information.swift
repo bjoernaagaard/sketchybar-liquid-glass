@@ -11,9 +11,8 @@ struct FrontSnapshot: Decodable, Equatable {
 
 extension Popups {
     func readFront() async -> FrontSnapshot? {
-        let paths = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
-        guard let path = paths.map({ "\($0)/aerospace" }).first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
-              let result = try? await ProcessCapture().run(URL(fileURLWithPath: path),
+        guard let executable = executableOnPath("aerospace"),
+              let result = try? await ProcessCapture().run(executable,
                   ["list-windows", "--focused", "--json", "--format", "%{app-name} %{window-title}"]),
               !Task.isCancelled, result.status == 0,
               let windows = try? JSONDecoder().decode([FrontSnapshot].self, from: result.output) else { return nil }
@@ -75,9 +74,7 @@ extension Popups {
             }
             return values.isEmpty ? nil : values
         }
-        let paths = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
-        guard let path = paths.map({ "\($0)/aerospace" }).first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return nil }
-        let executable = URL(fileURLWithPath: path)
+        guard let executable = executableOnPath("aerospace") else { return nil }
         if case .workspace(let id, _) = source {
             guard let result = try? await capture.run(executable, ["list-windows", "--workspace", id, "--json", "--format", "%{app-name}"]),
                   !Task.isCancelled, result.status == 0,
