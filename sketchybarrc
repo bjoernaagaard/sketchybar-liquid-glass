@@ -1,5 +1,5 @@
 #!/bin/bash
-# Before feature work, read AGENTS.md and ~/.agents/skills/write-swift/SKILL.md.
+# Before feature work, read AGENTS.md.
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/sketchybar}"
 source "$CONFIG_DIR/theme.sh"
 PLUGIN_DIR="$CONFIG_DIR/plugins"

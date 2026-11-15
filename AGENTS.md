@@ -2,9 +2,9 @@
 
 ## Before the next feature
 
-Read `~/.agents/skills/write-swift/SKILL.md` completely before adding or changing a feature. Apply its Swift principles, not just its syntax suggestions. If the skill is unavailable, report that and follow the project rules below. Check `xcrun swiftc --version` and the installed SDK before adopting a language feature or API.
+Read the `swift-best-practices` skill completely before adding or changing a feature. Apply its Swift principles, not just its syntax suggestions. If the skill is missing, install it with `npx skills add bjoernaagaard/modern-swift`. If you can't install it, report that and follow the project rules below. Check `xcrun swiftc --version` and the installed SDK before adopting a language feature or API.
 
-For interface or motion changes, also read `~/.agents/skills/apple-design/SKILL.md`. Preserve the existing appearance unless the user requests a design change.
+For interface or motion changes, also read the `apple-design` skill, which `npx skills add emilkowalski/skills` installs. Preserve the existing appearance unless the user requests a design change.
 
 ## Swift rules that carry forward
 
@@ -35,10 +35,11 @@ Never write unit tests, integration tests, or mocks. Write another kind of test 
 
 Run `plugins/popup.sh build` and the real affected command or popup. Popups must also be checked through actual bar clicks, not only from a terminal: process ancestry and calendar permission attribution differ. Synthetic clicks take over the user's cursor while they work, so keep them rare. Read the item bounds first and plan one pass that covers every case. Run that pass once and then move the cursor back to where it was. Do not click again to retry a step that passed, to take a screenshot, or to check state that `sketchybar --query` or the window bounds can show. Click only the popups the change affects. If a step fails, find the cause from the code, logs, and window bounds before clicking again. Press Escape only while a popup window is confirmed open, because otherwise it reaches the user's front app. Dismiss with a click on an empty part of the bar, never on an app window. macOS `pgrep` needs `-a` to find SketchyBar when it is an ancestor. Check shell syntax with `/bin/bash -n` and the diff with `git diff --check`. Do not disable compiler safety settings to make a feature build.
 
-Restart the existing service with:
+Restart the existing service with the command for how it runs. The author's machines run it as a LaunchAgent from their mise config, and a Homebrew install runs it as a Homebrew service.
 
 ```sh
-launchctl kickstart -k gui/$(id -u)/dev.mise.sketchybar
+launchctl kickstart -k gui/$(id -u)/dev.mise.sketchybar   # the author's machines
+brew services restart sketchybar                          # a Homebrew install
 ```
 
-Use `sketchybar --query <item>` for item bounds and the native window bounds for popups. Capture the whole bar at `-R0,0,3008,46`, the right end at `-R2648,0,360,50`, and the media island between the left island and the notch at the x range from `sketchybar --query island.media`, extending the height when inspecting a popup. The single pass covers opening, switching popups, outside click dismissal, Escape, and behavior after a restart. Plan the pass from the popups the change touches. The full pass over volume, network, and clock is six clicks and one Escape: volume, network, clock, empty bar, volume, then restart while it is open, then clock and Escape. A change that touches fewer popups needs fewer clicks. Take screenshots while the pass has a popup open, not with extra clicks. Do not change live network connections or calendar data just to demonstrate a code change. Delete screenshots and all scratch artifacts when finished. Leave one running bar and a clean, pushed working tree.
+Use `sketchybar --query <item>` for item bounds and the native window bounds for popups. On the author's 3008 point wide display, capture the whole bar at `-R0,0,3008,46` and the right end at `-R2648,0,360,50`. On another display, take the x range from `sketchybar --query bar`. Capture the media island between the left island and the notch at the x range from `sketchybar --query island.media`, extending the height when inspecting a popup. The single pass covers opening, switching popups, outside click dismissal, Escape, and behavior after a restart. Plan the pass from the popups the change touches. The full pass over volume, network, and clock is six clicks and one Escape: volume, network, clock, empty bar, volume, then restart while it is open, then clock and Escape. A change that touches fewer popups needs fewer clicks. Take screenshots while the pass has a popup open, not with extra clicks. Do not change live network connections or calendar data just to demonstrate a code change. Delete screenshots and all scratch artifacts when finished. Leave one running bar and a clean, pushed working tree.
